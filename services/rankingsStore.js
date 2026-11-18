@@ -10,7 +10,7 @@ exports.loadRankData = loadRankData;
 exports.RANK_FILE_HELP = void 0;
 
 exports.RANK_FILE_HELP = {
-    'data/rankings.csv': ['county', 'state', 'payor', 'planType', 'metric', 'value', 'asOf'],
+    'data/rankings.csv': ['county', 'state', 'payor', 'planType', 'metric', 'value', 'asOf', 'rank'],
     'data/roster.csv': ['entityType', 'name', 'county', 'state', 'payor', 'planType', 'reach', 'overlap'],
 };
 
@@ -24,6 +24,7 @@ const RANK_ALIASES = {
     value: ['value', 'reach', 'beneficiaryreach', 'metricvalue'],
     asOf: ['asof', 'as_of', 'asofdate', 'date', 'rosterdate'],
     network: ['network', 'networkname'],
+    rank: ['rank', 'publishedrank', 'rankpayorplantype'],
 };
 
 const ROSTER_ALIASES = {
@@ -125,6 +126,7 @@ function parseRankings(text) {
         const county = cell(row, index, 'county');
         const value = numberCell(cell(row, index, 'value'));
         if (!payor || !county || value == null) return null;
+        const rank = numberCell(cell(row, index, 'rank'));
         return {
             county,
             state: (cell(row, index, 'state') || 'TX').toUpperCase(),
@@ -135,6 +137,7 @@ function parseRankings(text) {
             value,
             asOf: cell(row, index, 'asOf'),
             network: cell(row, index, 'network'),
+            publishedRank: rank != null && rank > 0 ? rank : null,
         };
     });
 }

@@ -69,6 +69,31 @@ function scope(message, extra = {}) {
     strict_1.equal(rows[0].value, 10000);
     strict_1.equal(rows[0].planType, 'HMO');
     strict_1.equal(rows[0].asOf, '2026-01-15');
+    strict_1.equal(rows[0].publishedRank, null);
+});
+
+(0, node_test_1.test)('suggests payors and plan types without selecting one', () => {
+    const options = (0, rankService_1.rankOptions)({ q: 'Where do we rank in Houston County?' }, { rankings: WIDE, roster: [] });
+    strict_1.equal(options.county, 'Houston');
+    strict_1.deepEqual(options.planTypes, ['HMO']);
+    strict_1.deepEqual(options.payors, ['Aetna', 'Humana', 'UnitedHealthcare']);
+    const filtered = (0, rankService_1.rankOptions)({ county: 'Houston', planType: 'PPO' }, { rankings: WIDE, roster: [] });
+    strict_1.deepEqual(filtered.payors, []);
+});
+
+(0, node_test_1.test)('uses the dashboard rank instead of recomputing it from the score', async () => {
+    (0, rankService_1.resetRankSessions)();
+    const rankings = [
+        { county: 'Houston', state: 'TX', payor: 'CVS Health Corporation', planType: 'HMO', metric: 'Network score', value: 85, publishedRank: 1, asOf: '2026', network: '', fips: '' },
+        { county: 'Houston', state: 'TX', payor: 'Humana Inc.', planType: 'HMO', metric: 'Network score', value: 90, publishedRank: 7, asOf: '2026', network: '', fips: '' },
+    ];
+    const result = await (0, rankService_1.answerRank)(scope('Where does Humana rank in Houston County?'), { rankings, roster: [] });
+    strict_1.equal(result.kind, 'baseline');
+    strict_1.equal(result.baseline.rank, 7);
+    strict_1.equal(result.baseline.of, 7);
+    strict_1.match(result.answer, /Humana Inc\. HMO is rank 7 of 7 in Houston County, Texas, in terms of current Network\./);
+    strict_1.match(result.answer, /CVS Health Corporation is the next better best network\./);
+    strict_1.equal(result.standings.find((row) => row.payor === 'Humana Inc.').rank, 7);
 });
 
 (0, node_test_1.test)('confirms the entity before predicting', async () => {
@@ -243,6 +268,37 @@ const SMALL_GROUPS = [
     const missing = await (0, rankService_1.answerRank)(scope('How do we rank against payer X in Houston County?'), { rankings: WIDE, roster: WIDE_ROSTER });
     strict_1.equal(missing.kind, 'unavailable');
     strict_1.match(missing.answer, /No roster is loaded for X/);
+});
+
+(0, node_test_1.test)('a county reply selects that county, not the example county', async () => {
+    (0, rankService_1.resetRankSessions)();
+    const rankings = [
+        { county: 'Harris', state: 'TX', payor: 'Humana', planType: 'HMO', metric: 'BeneficiaryReach', value: 5000, asOf: '2026-01-15', network: '', fips: '' },
+        { county: 'Harris', state: 'TX', payor: 'UnitedHealthcare', planType: 'HMO', metric: 'BeneficiaryReach', value: 8000, asOf: '2026-01-15', network: '', fips: '' },
+        { county: 'Houston', state: 'TX', payor: 'Humana', planType: 'HMO', metric: 'BeneficiaryReach', value: 10000, asOf: '2026-01-15', network: '', fips: '' },
+        { county: 'Houston', state: 'TX', payor: 'UnitedHealthcare', planType: 'HMO', metric: 'BeneficiaryReach', value: 14000, asOf: '2026-01-15', network: '', fips: '' },
+    ];
+    const deps = { rankings, roster: [] };
+    const asked = await (0, rankService_1.answerRank)(scope('which network has best and worst rank'), deps);
+    strict_1.equal(asked.kind, 'clarify');
+    strict_1.match(asked.answer, /Harris/);
+    strict_1.match(asked.answer, /Houston/);
+    const harris = await (0, rankService_1.answerRank)(scope('Harris', { sessionId: asked.sessionId }), deps);
+    strict_1.equal(harris.geography.county, 'Harris');
+    strict_1.match(harris.answer, /Harris County/);
+    strict_1.doesNotMatch(harris.answer, /Houston/);
+    const lower = await (0, rankService_1.answerRank)(scope('harris', { earlier: 'which network has best and worst rank' }), deps);
+    strict_1.equal(lower.geography.county, 'Harris');
+    const houston = await (0, rankService_1.answerRank)(scope('houston', { earlier: 'which network has best and worst rank' }), deps);
+    strict_1.equal(houston.geography.county, 'Houston');
+    strict_1.match(houston.answer, /Houston County/);
+    strict_1.doesNotMatch(houston.answer, /Harris/);
+    const options = (0, rankService_1.rankOptions)({ q: 'Harris County' }, deps);
+    strict_1.equal(options.county, 'Harris');
+    const unknown = await (0, rankService_1.answerRank)(scope('Narnia'), deps);
+    strict_1.equal(unknown.kind, 'clarify');
+    strict_1.match(unknown.answer, /Narnia/);
+    strict_1.match(unknown.answer, /not a loaded Texas county/);
 });
 
 (0, node_test_1.test)('a write instruction is refused', async () => {

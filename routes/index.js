@@ -4,7 +4,14 @@ const { getPool } = require('../dataaccess/db')
 const { ASK_ERROR_MESSAGE, answerQuestion, askRequestSchema, formatAskIssues } = require('../services/askService')
 const { chat, chatRequestSchema, formatChatIssues, forwardChatStream, LlmHttpError } = require('../services/llm')
 const { networkChatSystemPrompt } = require('../services/prompts')
-const { answerRank, looksLikeRankQuestion, refusesWrite } = require('../services/rankService')
+const { answerRank, looksLikeRankQuestion, rankOptions, refusesWrite } = require('../services/rankService')
+
+function continuesRank(text) {
+  const value = String(text || '').trim()
+  if (!value || value.length > 80) return false
+  if (looksLikeRankQuestion(value)) return true
+  return value.split(/\s+/).length <= 4
+}
 const { databaseConfig, getSchemaContext, schemaPanel } = require('../services/schemaService')
 
 const router = express.Router()
@@ -52,14 +59,30 @@ router.post('/ask', async (req, res) => {
   }
 })
 
-function lastUserText(messages) {
-  const users = (messages || []).filter((message) => message.role === 'user')
-  return users.at(-1)?.content || ''
+function userTexts(messages) {
+  return (messages || []).filter((message) => message.role === 'user').map((message) => message.content)
 }
+
+router.get('/rank/options', (req, res) => {
+  try {
+    return res.json(rankOptions({
+      q: req.query.q,
+      county: req.query.county,
+      planType: req.query.planType,
+    }))
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'rank_options', name: err instanceof Error ? err.name : 'Error' }))
+    return res.status(500).json({ error: 'Rank options are unavailable' })
+  }
+})
 
 router.post('/rank', async (req, res) => {
   try {
-    const result = await answerRank(req.body ?? {})
+    const body = req.body ?? {}
+    const texts = userTexts(body.messages)
+    const message = String(body.message || body.question || texts.at(-1) || '').trim()
+    const earlier = body.earlier || texts.slice(0, -1).join('\n')
+    const result = await answerRank({ ...body, message, earlier })
     const status = result.status || 200
     const { status: _status, ...body } = result
     return res.status(status).json(body)
@@ -72,13 +95,16 @@ router.post('/rank', async (req, res) => {
 router.post('/llm/chat', async (req, res) => {
   const parsed = chatRequestSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: formatChatIssues(parsed.error) })
-  const userText = lastUserText(parsed.data.messages)
+  const texts = userTexts(parsed.data.messages)
+  const userText = texts.at(-1) || ''
+  const earlier = texts.slice(0, -1).join('\n')
   if (refusesWrite(userText) || refusesWrite(parsed.data.system)) {
     return res.json({ content: "I can't change the network tables. Ask a read-only rank question.", kind: 'refused' })
   }
-  if (looksLikeRankQuestion(userText) && !/\bjson\b/i.test(parsed.data.system || '')) {
+  const rankThread = looksLikeRankQuestion(userText) || (texts.some((text) => looksLikeRankQuestion(text)) && continuesRank(userText))
+  if (rankThread && !/\bjson\b/i.test(parsed.data.system || '')) {
     try {
-      const result = await answerRank({ ...req.body, message: userText })
+      const result = await answerRank({ ...req.body, message: userText, earlier })
       const status = result.status || 200
       const { status: _status, ...body } = result
       return res.status(status).json({ content: body.answer, ...body })

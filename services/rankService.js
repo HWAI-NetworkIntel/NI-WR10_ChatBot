@@ -13,6 +13,7 @@ const rankingsStore_1 = require("./rankingsStore");
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.answerRank = answerRank;
 exports.looksLikeRankQuestion = looksLikeRankQuestion;
+exports.rankOptions = rankOptions;
 exports.resetRankSessions = resetRankSessions;
 exports.interpretRankMessage = interpretRankMessage;
 exports.refusesWrite = refusesWrite;
@@ -85,9 +86,14 @@ function overlapFor(entity, focalPayor, competitorPayors) {
 function aggregate(rows, focalName) {
     const byPayor = new Map();
     for (const row of rows) {
-        const current = byPayor.get(row.payor) ?? { payor: row.payor, value: 0, networks: [] };
+        const current = byPayor.get(row.payor) ?? { payor: row.payor, value: 0, networks: [], publishedRank: null };
         current.value += row.value;
         if (row.network) current.networks.push(row.network);
+        if (row.publishedRank != null) {
+            current.publishedRank = current.publishedRank == null
+                ? row.publishedRank
+                : Math.min(current.publishedRank, row.publishedRank);
+        }
         byPayor.set(row.payor, current);
     }
     const focal = byPayor.get(focalName);
@@ -95,9 +101,116 @@ function aggregate(rows, focalName) {
     return { focal, competitors };
 }
 
+function knownCounties(rankings) {
+    const byKey = new Map();
+    for (const row of rankings || []) {
+        if ((row.state || 'TX').toUpperCase() !== 'TX') continue;
+        const name = String(row.county || '').trim();
+        const key = countyKey(name);
+        if (key && !byKey.has(key)) byKey.set(key, name);
+    }
+    return byKey;
+}
+
+function exactCounty(text, counties) {
+    if (!counties?.size) return '';
+    const key = countyKey(text).replace(/\b(texas|tx|please|thanks)\b/g, ' ').replace(/\s+/g, ' ').trim();
+    return counties.get(key) || '';
+}
+
+function trailingCounty(text, counties) {
+    if (!counties?.size) return '';
+    const words = countyKey(text).replace(/\b(texas|tx|please|thanks)\b/g, ' ').split(' ').filter(Boolean);
+    for (let size = Math.min(3, words.length); size >= 1; size -= 1) {
+        const key = words.slice(-size).join(' ');
+        if (counties.has(key)) return counties.get(key);
+    }
+    return '';
+}
+
+/** County the user named. A bare reply such as "Harris" or "houston" is that county, not the example county. */
+function resolveCounty(message, counties) {
+    const text = String(message || '').trim();
+    if (!text) return '';
+    const exact = exactCounty(text, counties);
+    if (exact) return exact;
+    const explicit = [...text.matchAll(/\b(?:in|for|within)\s+([A-Za-z][A-Za-z .'-]*?)\s+county\b/gi)];
+    if (!counties?.size) {
+        if (explicit.length) return explicit[explicit.length - 1][1].trim();
+        const bare = text.match(/^([A-Za-z][A-Za-z .'-]*?)\s+county\b/i);
+        return bare ? bare[1].trim() : '';
+    }
+    const hits = [];
+    for (const match of explicit) {
+        const found = exactCounty(match[1], counties) || trailingCounty(match[1], counties);
+        if (found) hits.push({ index: match.index, name: found });
+    }
+    for (const [key, name] of counties) {
+        const phrase = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+');
+        const re = new RegExp(`\\b${phrase}\\s+county\\b(?!\\s+(?:clinic|hospital|health|system|group|medical))`, 'gi');
+        let match;
+        while ((match = re.exec(text))) hits.push({ index: match.index, name });
+    }
+    const trail = trailingCounty(text, counties);
+    if (trail) hits.push({ index: text.length, name: trail });
+    if (!hits.length) return '';
+    hits.sort((a, b) => a.index - b.index);
+    return hits[hits.length - 1].name;
+}
+
+function countyLines(text, counties) {
+    const lines = String(text || '').split('\n').map((line) => line.trim()).filter(Boolean).reverse();
+    for (const line of lines) {
+        const found = resolveCounty(line, counties);
+        if (found) return found;
+    }
+    return '';
+}
+
+function countyAttempt(message) {
+    const text = String(message || '').trim();
+    if (!text || text.length > 40 || looksLikeRankQuestion(text)) return '';
+    if (/^(yes|yep|yeah|no|nope)$/i.test(text)) return '';
+    return text;
+}
+
+function countyOnlyReply(message, county) {
+    if (!county || looksLikeRankQuestion(message)) return false;
+    const words = countyKey(message).split(' ').filter((word) => !/^(texas|tx|please|thanks)$/.test(word));
+    return words.join(' ') === countyKey(county);
+}
+
+function countySample(counties) {
+    const names = [...counties.values()].sort((a, b) => a.localeCompare(b));
+    const preferred = ['Harris', 'Houston', 'Dallas', 'Bexar', 'Tarrant', 'Travis'];
+    const picked = preferred.filter((name) => counties.has(countyKey(name)));
+    for (const name of names) {
+        if (picked.length >= 6) break;
+        if (!picked.some((item) => countyKey(item) === countyKey(name))) picked.push(name);
+    }
+    return { picked, total: names.length, all: names };
+}
+
+function countyClarify(counties, attempt) {
+    const { picked, total, all } = countySample(counties);
+    const list = picked.join(', ');
+    const more = total > picked.length ? ` and ${total - picked.length} more` : '';
+    if (attempt) {
+        return {
+            answer: `"${attempt}" is not a loaded Texas county. Rank stays on the county you name and does not switch to a different county. Loaded counties include ${list}${more}.`,
+            suggestions: all,
+        };
+    }
+    return {
+        answer: list
+            ? `Name the Texas county. You can reply with the county name alone, such as ${picked[0]}. Rank is against competitor networks in that county. Loaded counties include ${list}${more}.`
+            : 'Name the Texas county. Rank is against competitor networks in that county.',
+        suggestions: all,
+    };
+}
+
 function extractCounty(message) {
-    const match = String(message || '').match(/\b(?:in|for|within)\s+([A-Za-z][A-Za-z .'-]*?)\s+county\b/i);
-    return match ? match[1].trim() : '';
+    return resolveCounty(message);
 }
 
 function countWord(value) {
@@ -248,17 +361,55 @@ function answerFromPrediction(session, result, metric, asOf, assumptions, extra)
     return answer;
 }
 
+function publishedPlacement(focal, competitors) {
+    if (focal.publishedRank == null) return null;
+    const rows = [focal, ...competitors].filter((row) => row.publishedRank != null);
+    if (!rows.length) return null;
+    const above = rows
+        .filter((row) => row.payor !== focal.payor && row.publishedRank < focal.publishedRank)
+        .sort((a, b) => b.publishedRank - a.publishedRank || a.payor.localeCompare(b.payor))[0] ?? null;
+    const below = rows
+        .filter((row) => row.payor !== focal.payor && row.publishedRank > focal.publishedRank)
+        .sort((a, b) => a.publishedRank - b.publishedRank || a.payor.localeCompare(b.payor))[0] ?? null;
+    return {
+        rank: focal.publishedRank,
+        of: Math.max(...rows.map((row) => row.publishedRank)),
+        above,
+        below,
+        standings: rows
+            .slice()
+            .sort((a, b) => a.publishedRank - b.publishedRank || a.payor.localeCompare(b.payor))
+            .map((row) => ({ payor: row.payor, value: row.value, focal: row.payor === focal.payor, rank: row.publishedRank })),
+    };
+}
+
 function baselineBody(session, pack, assumptions) {
     const { focal, competitors, metric, asOf } = pack;
     const result = (0, rankModel_1.predictChange)({ focal, competitors, changes: [] });
+    const published = publishedPlacement(focal, competitors);
+    if (published) {
+        result.baseline.rank = published.rank;
+        result.baseline.of = published.of;
+        result.baseline.nextBetter = published.above ? { payor: published.above.payor, value: published.above.value } : null;
+        result.baseline.nextWorse = published.below ? { payor: published.below.payor, value: published.below.value } : null;
+        result.baseline.reachToNextBetterRank = published.above ? published.rank - published.above.publishedRank : null;
+        result.baseline.reachBeforeWorseRank = published.below ? published.below.publishedRank - published.rank : null;
+    }
     const gap = result.baseline.reachToNextBetterRank;
     const cushion = result.baseline.reachBeforeWorseRank;
-    const answer = [
-        `${focal.payor} ${session.planType} is rank ${result.baseline.rank} of ${result.baseline.of} in ${session.county} County, Texas, on ${metric}${asOf ? ` as of ${asOf}` : ''}.`,
-        `The competitor set is ${[focal, ...competitors].map((row) => row.payor).join(', ')}.`,
-        gap == null ? 'There is no network above.' : `${comma(gap)} ${metric} separates it from ${result.baseline.nextBetter.payor}.`,
-        cushion == null ? 'There is no network below.' : `${comma(cushion)} ${metric} can be lost before it ties ${result.baseline.nextWorse.payor}.`,
-    ].join(' ');
+    const names = [focal, ...competitors].map((row) => row.payor).join(', ');
+    const answer = published
+        ? [
+            `${focal.payor} ${session.planType} is rank ${published.rank} of ${published.of} in ${session.county} County, Texas, in terms of current Network.`,
+            `The competitor set is ${names}.`,
+            published.above ? `${published.above.payor} is the next better best network.` : 'There is no better network.',
+        ].join(' ')
+        : [
+            `${focal.payor} ${session.planType} is rank ${result.baseline.rank} of ${result.baseline.of} in ${session.county} County, Texas, on ${metric}${asOf ? ` as of ${asOf}` : ''}.`,
+            `The competitor set is ${names}.`,
+            gap == null ? 'There is no network above.' : `${comma(gap)} ${metric} separates it from ${result.baseline.nextBetter.payor}.`,
+            cushion == null ? 'There is no network below.' : `${comma(cushion)} ${metric} can be lost before it ties ${result.baseline.nextWorse.payor}.`,
+        ].join(' ');
     return {
         kind: 'baseline',
         answer,
@@ -272,8 +423,10 @@ function baselineBody(session, pack, assumptions) {
             reachToNextBetterRank: result.baseline.reachToNextBetterRank,
             reachBeforeWorseRank: result.baseline.reachBeforeWorseRank,
         },
-        standings: (0, rankModel_1.standings)(focal, competitors),
-        assumptions,
+        standings: published ? published.standings : (0, rankModel_1.standings)(focal, competitors),
+        assumptions: published
+            ? [...assumptions, 'This rank is rank_payor_plantype from the provider dashboard file. A lower number is a better network.']
+            : assumptions,
         method: METHOD,
     };
 }
@@ -343,6 +496,30 @@ function loadDeps(deps) {
     return (0, rankingsStore_1.loadRankData)(directory);
 }
 
+function uniqueSorted(values) {
+    return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
+/** Payors and plan types present in the rankings. Nothing here is preselected. */
+function rankOptions(input = {}, deps) {
+    const data = loadDeps(deps);
+    const counties = knownCounties(data.rankings);
+    const rawCounty = String(input.county || resolveCounty(input.q || input.message || '', counties) || '').trim();
+    const county = counties.get(countyKey(rawCounty)) || rawCounty;
+    const planType = String(input.planType || '').trim();
+    let rows = (data.rankings || []).filter((row) => (row.state || 'TX').toUpperCase() === 'TX');
+    if (county) rows = rows.filter((row) => samePlace(row, county));
+    const planTypes = uniqueSorted(rows.map((row) => row.planType));
+    const payorRows = planType
+        ? rows.filter((row) => String(row.planType).toLowerCase() === planType.toLowerCase())
+        : rows;
+    return {
+        county: county || null,
+        planTypes,
+        payors: uniqueSorted(payorRows.map((row) => row.payor)),
+    };
+}
+
 async function answerRank(input, deps) {
     const message = String(input.message || input.question || '').trim();
     if (refusesWrite(message)) {
@@ -359,6 +536,8 @@ async function answerRank(input, deps) {
     }
     const data = loadDeps(deps);
     const previous = input.sessionId ? sessions.get(input.sessionId) : null;
+    const counties = knownCounties(data.rankings);
+    const earlier = String(input.earlier || '');
     const interpreted = interpretRankMessage(message, previous);
     if (interpreted.affirm && previous?.pending && interpreted.intent !== 'geography') {
         if (previous.pending.names) interpreted.namedGroups = previous.pending.names;
@@ -376,9 +555,32 @@ async function answerRank(input, deps) {
     if (/\b(california|florida|new york|oklahoma|louisiana)\b/i.test(message)) {
         return { kind: 'clarify', answer: 'Only Texas geographies are in scope. Name a Texas county.' };
     }
-    const county = interpreted.county || input.geography?.county || input.context?.county || '';
+    const fromLatest = resolveCounty(message, counties);
+    const freshQuestion = looksLikeRankQuestion(message) && !fromLatest;
+    const fromEarlier = !fromLatest && !freshQuestion ? countyLines(earlier, counties) : '';
+    if (countyOnlyReply(message, fromLatest)) {
+        const priorText = previous?.question || earlier;
+        if (priorText) {
+            const prior = interpretRankMessage(priorText, previous);
+            if (prior.intent !== 'baseline') interpreted.intent = prior.intent;
+            if (!interpreted.change && prior.change) interpreted.change = prior.change;
+            if (!interpreted.smallGroups && prior.smallGroups) interpreted.smallGroups = prior.smallGroups;
+            if (!interpreted.targetRank && prior.targetRank) interpreted.targetRank = prior.targetRank;
+            if (!interpreted.closeRank && prior.closeRank) interpreted.closeRank = prior.closeRank;
+            if (!interpreted.against && prior.against) interpreted.against = prior.against;
+        }
+    }
+    const requested = String(input.county || '').trim();
+    const requestedCounty = requested ? (counties.get(countyKey(requested)) || requested) : '';
+    const county = counties.get(countyKey(fromLatest || requestedCounty || fromEarlier || interpreted.county || input.geography?.county || input.context?.county || ''))
+        || fromLatest || requestedCounty || fromEarlier || interpreted.county || input.geography?.county || input.context?.county || '';
     if (!county) {
-        return { kind: 'clarify', answer: 'Name the Texas county, for example Houston County. Rank is always against competitor networks in that county.' };
+        const prompt = countyClarify(counties, countyAttempt(message));
+        const saved = remember(previous, {
+            question: looksLikeRankQuestion(message) ? message : (previous?.question || earlier || message),
+            awaitingCounty: true,
+        });
+        return { kind: 'clarify', sessionId: saved.id, answer: prompt.answer, suggestions: prompt.suggestions, suggestionField: 'county' };
     }
     if (!data.rankings.length) {
         return {
@@ -388,9 +590,13 @@ async function answerRank(input, deps) {
             assumptions: ['Competitor networks are held constant unless you name a competitor change.'],
         };
     }
-    const focalChoice = chooseFocal(`${message} ${previous?.payor || ''} ${previous?.planType || ''}`, scope.data, data.rankings);
+    const focalChoice = chooseFocal(`${message} ${earlier} ${previous?.question || ''} ${previous?.payor || ''} ${previous?.planType || ''}`, scope.data, data.rankings);
     if (focalChoice.clarify && !(previous?.payor && previous?.planType)) {
-        return { kind: 'clarify', answer: focalChoice.clarify };
+        const saved = remember(previous, {
+            county,
+            question: previous?.question || (looksLikeRankQuestion(message) ? message : earlier) || message,
+        });
+        return { kind: 'clarify', sessionId: saved.id, answer: `${focalChoice.clarify} The county is ${county} County.` };
     }
     const payor = focalChoice.payor || previous?.payor;
     const planType = focalChoice.planType || previous?.planType;
@@ -399,7 +605,8 @@ async function answerRank(input, deps) {
         return { kind: 'needs_data', answer: `No Texas rankings are loaded for ${county} County and ${planType}.`, expectedFiles: rankingsStore_1.RANK_FILE_HELP };
     }
     const metrics = [...new Set(slice.map((row) => row.metric))];
-    const metric = metrics.find((item) => message.toLowerCase().includes(item.toLowerCase())) || (metrics.length === 1 ? metrics[0] : null);
+    const metricSource = `${message} ${earlier} ${previous?.question || ''}`.toLowerCase();
+    const metric = metrics.find((item) => metricSource.includes(item.toLowerCase())) || (metrics.length === 1 ? metrics[0] : null);
     if (!metric) {
         const saved = remember(previous, { county, payor, planType });
         const lead = interpreted.intent === 'best'
@@ -410,8 +617,13 @@ async function answerRank(input, deps) {
     const metricRows = slice.filter((row) => row.metric === metric);
     const rankingsPayor = matchPayor(payor, metricRows);
     if (!rankingsPayor) {
-        const known = [...new Set(metricRows.map((row) => row.payor))];
-        return { kind: 'clarify', answer: `${payor} is not in the ${county} County ${planType} rankings. Loaded payors: ${known.join(', ')}.` };
+        const known = uniqueSorted(metricRows.map((row) => row.payor));
+        return {
+            kind: 'clarify',
+            answer: `${payor} is not in the ${county} County ${planType} rankings. Choose a payor that is loaded for this county.`,
+            suggestions: known,
+            suggestionField: 'payor',
+        };
     }
     const { focal, competitors } = aggregate(metricRows, rankingsPayor);
     if (!focal) return { kind: 'clarify', answer: `${payor} has no ${metric} value in ${county} County.` };
