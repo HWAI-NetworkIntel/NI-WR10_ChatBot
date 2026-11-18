@@ -15,7 +15,6 @@ function continuesRank(text) {
 const { databaseConfig, getSchemaContext, schemaPanel } = require('../services/schemaService')
 
 const router = express.Router()
-const NO_DOCUMENTED_TABLES = 'the login cannot see any documented table'
 
 router.get('/health', async (_req, res) => {
   const body = { status: 'error', database: config.DB_DATABASE, dbOk: false, tableCount: 0 }

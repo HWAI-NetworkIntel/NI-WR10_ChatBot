@@ -1,10 +1,12 @@
-﻿/** HTTP application for live NI database questions. */
+﻿/** Express application for network impact prediction. */
 const cors = require('cors')
 const express = require('express')
 const rateLimit = require('express-rate-limit')
 const helmet = require('helmet')
 const { config } = require('./config/config')
 const routes = require('./routes')
+const { AppError } = require('./utils/AppError')
+const { errorHandler } = require('./utils/errorHandler')
 
 const app = express()
 
@@ -15,27 +17,18 @@ app.use(cors({
     return callback(null, false)
   },
 }))
-app.use((req, res, next) => {
-  const started = Date.now()
-  const path = req.originalUrl.split('?')[0] ?? req.path
-  res.on('finish', () => console.log(JSON.stringify({ method: req.method, path, status: res.statusCode, ms: Date.now() - started })))
-  next()
-})
 app.use(express.json({ limit: '100kb' }))
-app.use(['/ask', '/llm', '/rank'], rateLimit({
+app.use('/api', rateLimit({
   windowMs: 60_000,
   limit: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests' },
+  handler: (_req, res) => res.status(429).json({
+    error: { code: 'RATE_LIMITED', message: 'Too many requests. Please try again later.' },
+  }),
 }))
 app.use(routes)
-app.use((err, _req, res, next) => {
-  if (res.headersSent) return next(err)
-  const status = typeof err === 'object' && err !== null && 'status' in err && typeof err.status === 'number' ? err.status : 500
-  const code = status >= 400 && status < 600 ? status : 500
-  const error = code === 413 ? 'Payload too large' : code === 500 ? 'Internal error' : 'Bad request'
-  return res.status(code).json({ error })
-})
+app.use((_req, _res, next) => next(new AppError(404, 'NOT_FOUND', 'Route not found.')))
+app.use(errorHandler)
 
 module.exports = app

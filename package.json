@@ -1,12 +1,10 @@
 {
   "name": "ni-chat-service",
   "version": "1.0.0",
-  "description": "Text-to-SQL chat service for NI_hackathon_data",
+  "description": "API for network impact prediction",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
-    "test": "node --test test/askService.test.js test/eval.test.js test/examples.test.js test/llm.test.js test/rank.test.js test/schemaContext.test.js test/sqlGuard.test.js",
-    "eval": "node scripts/eval.js"
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "cors": "2.8.6",
@@ -15,7 +13,6 @@
     "express-rate-limit": "8.7.4",
     "helmet": "8.3.0",
     "mssql": "11.0.1",
-    "node-sql-parser": "5.3.4",
     "zod": "4.6.7"
   },
   "private": true
