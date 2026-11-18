@@ -1,38 +1,21 @@
-# NI live-data chat kit
+# Network Impact Prediction API
 
-Lets the Network What-If chatbot answer questions from `NI_hackathon_data` in real time, with references.
+Backend API for evaluating provider network changes and comparing a network with competitors. The prediction algorithm is supplied by a separate team and plugs into `services/networkImpactService.js`.
 
-## How a question is answered
+## Routes
 
-1. **Route.** The PNC chat decides: what-if scenario (existing engine) or data question (this service).
-2. **Write SQL.** The service sends the LLM the question plus `docs/SCHEMA_REFERENCE.md` content (merged with the live
-   schema, about 6K tokens) and 10 worked examples. The LLM returns one SELECT, an explanation and its assumptions.
-3. **Check.** `sqlGuard` allows one SELECT on the 41 documented tables only. Rejected queries go back to the LLM once with the reason.
-4. **Run.** Read-only login, max 500 rows, 15 s timeout.
-5. **Explain.** A second LLM call explains the rows. Numbers not present in the rows are rejected, and a template is used instead.
-6. **Show references.** The tables used (with their descriptions), the SQL, and the assumptions appear under the answer, with a link to the schema reference.
+- `GET /health`: process health check.
+- `POST /api/network-impact/predict`: accepts a JSON object and passes it to the prediction service. It returns `501 ALGORITHM_NOT_CONFIGURED` until the algorithm is connected.
 
-## Safety layers
-1. Database login can only SELECT the allowed tables (`sql/create_readonly_login.sql`).
-2. `utils/sqlGuard.js`: 8 tests including attack cases (13 tests across the kit).
-3. Row cap, timeout, rate limit, audit log of every generated query.
-4. The LLM key and DB password live only in the service's `.env`, never in the browser bundle.
-
-## Files
-- `CURSOR_PHASES_DB.md`: seven Cursor prompts with "Done when" checks
-- `docs/`: schema reference (Markdown for people and the LLM, JSON for code) and examples
-- `config/`, `dataaccess/`, `services/`, `test/`, `utils/`: JavaScript service modules and tests
-- `sql/`: read-only login script
-- `scripts/`: how the docs were generated from `NI_Table_Schema.xlsx`. If the schema changes, re-run:
-  `python3 scripts/parse_schema.py NI_Table_Schema.xlsx raw.json && python3 scripts/build_catalog.py raw.json docs`
+The request body is passed through as JSON until the algorithm contract is finalized. The controller returns the service result directly. Errors use `{ "error": { "code", "message" } }` and unexpected failures do not expose internal details.
 
 ## Run
 
-Use Node.js 20 or newer:
+Use Node.js 20 or newer. Configure `PORT` and `ALLOWED_ORIGIN` in `.env`.
 
 ```sh
 npm install
 npm start
 ```
 
-For development with automatic restart, run `npm run dev`. Run the automated tests with `npm test`.
+Run `npm run dev` to restart on file changes.
