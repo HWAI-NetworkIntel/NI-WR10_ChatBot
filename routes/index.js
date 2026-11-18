@@ -1,10 +1,34 @@
 ﻿const express = require('express')
 const { config } = require('../config/config')
-const { getPool } = require('../dataaccess/db')
-const { ASK_ERROR_MESSAGE, answerQuestion, askRequestSchema, formatAskIssues } = require('../services/askService')
-const { chat, chatRequestSchema, formatChatIssues, forwardChatStream, LlmHttpError } = require('../services/llm')
-const { networkChatSystemPrompt } = require('../services/prompts')
 const { answerRank, looksLikeRankQuestion, rankOptions, refusesWrite } = require('../services/rankService')
+
+function loadOptional(name) {
+  try {
+    return require(name)
+  } catch {
+    return null
+  }
+}
+
+const db = loadOptional('../dataaccess/db')
+const ask = loadOptional('../services/askService')
+const llm = loadOptional('../services/llm')
+const prompts = loadOptional('../services/prompts')
+const schema = loadOptional('../services/schemaService')
+const ASK_ERROR_MESSAGE = ask?.ASK_ERROR_MESSAGE
+const answerQuestion = ask?.answerQuestion
+const askRequestSchema = ask?.askRequestSchema
+const formatAskIssues = ask?.formatAskIssues
+const chat = llm?.chat
+const chatRequestSchema = llm?.chatRequestSchema
+const formatChatIssues = llm?.formatChatIssues
+const forwardChatStream = llm?.forwardChatStream
+const LlmHttpError = llm?.LlmHttpError
+const networkChatSystemPrompt = prompts?.networkChatSystemPrompt
+const getPool = db?.getPool
+const databaseConfig = schema?.databaseConfig
+const getSchemaContext = schema?.getSchemaContext
+const schemaPanel = schema?.schemaPanel
 
 function continuesRank(text) {
   const value = String(text || '').trim()
@@ -12,12 +36,13 @@ function continuesRank(text) {
   if (looksLikeRankQuestion(value)) return true
   return value.split(/\s+/).length <= 4
 }
-const { databaseConfig, getSchemaContext, schemaPanel } = require('../services/schemaService')
+const NO_DOCUMENTED_TABLES = 'the login cannot see any documented table'
 
 const router = express.Router()
 
 router.get('/health', async (_req, res) => {
-  const body = { status: 'error', database: config.DB_DATABASE, dbOk: false, tableCount: 0 }
+  const body = { status: 'error', database: config.DB_DATABASE || '', dbOk: false, tableCount: 0 }
+  if (!getPool || !databaseConfig || !getSchemaContext) return res.status(503).json(body)
   try {
     const pool = await getPool(databaseConfig())
     const result = await pool.request().query('SELECT COUNT(*) AS tableCount FROM INFORMATION_SCHEMA.TABLES')
@@ -32,18 +57,21 @@ router.get('/health', async (_req, res) => {
 })
 
 router.get('/schema/drift', (_req, res) => {
+  if (!getSchemaContext) return res.status(503).json({ error: 'Schema is not loaded' })
   const ctx = getSchemaContext()
   if (!ctx) return res.status(503).json({ error: 'Schema is not loaded' })
   return res.json(ctx.drift)
 })
 
 router.get('/schema', (_req, res) => {
+  if (!getSchemaContext || !schemaPanel) return res.status(503).json({ error: 'Schema is not loaded' })
   const ctx = getSchemaContext()
   if (!ctx) return res.status(503).json({ error: 'Schema is not loaded' })
   return res.json(schemaPanel(ctx))
 })
 
 router.post('/ask', async (req, res) => {
+  if (!askRequestSchema || !answerQuestion) return res.status(503).json({ error: 'Schema is not loaded' })
   const parsed = askRequestSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: formatAskIssues(parsed.error) })
   if (refusesWrite(parsed.data.question)) {
@@ -83,8 +111,8 @@ router.post('/rank', async (req, res) => {
     const earlier = body.earlier || texts.slice(0, -1).join('\n')
     const result = await answerRank({ ...body, message, earlier })
     const status = result.status || 200
-    const { status: _status, ...body } = result
-    return res.status(status).json(body)
+    const { status: _status, ...payload } = result
+    return res.status(status).json(payload)
   } catch (err) {
     console.error(JSON.stringify({ event: 'rank', name: err instanceof Error ? err.name : 'Error' }))
     return res.status(500).json({ kind: 'error', answer: "I couldn't evaluate that rank change." })
@@ -92,6 +120,7 @@ router.post('/rank', async (req, res) => {
 })
 
 router.post('/llm/chat', async (req, res) => {
+  if (!chatRequestSchema || !chat) return res.status(503).json({ error: 'LLM request failed' })
   const parsed = chatRequestSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: formatChatIssues(parsed.error) })
   const texts = userTexts(parsed.data.messages)

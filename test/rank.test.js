@@ -79,6 +79,16 @@ function scope(message, extra = {}) {
     strict_1.deepEqual(options.payors, ['Aetna', 'Humana', 'UnitedHealthcare']);
     const filtered = (0, rankService_1.rankOptions)({ county: 'Houston', planType: 'PPO' }, { rankings: WIDE, roster: [] });
     strict_1.deepEqual(filtered.payors, []);
+    const named = (0, rankService_1.rankOptions)({
+        q: 'Harris',
+        county: 'Houston',
+    }, {
+        rankings: WIDE.concat([
+            { county: 'Harris', state: 'TX', payor: 'Humana', planType: 'HMO', metric: 'BeneficiaryReach', value: 5000, asOf: '2026-01-15', network: '', fips: '' },
+        ]),
+        roster: [],
+    });
+    strict_1.equal(named.county, 'Harris');
 });
 
 (0, node_test_1.test)('uses the dashboard rank instead of recomputing it from the score', async () => {

@@ -5,18 +5,87 @@
  */
 const node_crypto_1 = require("node:crypto");
 const node_path_1 = require("node:path");
-const askService_1 = require("./askService");
+const zod_1 = require("zod");
 const countyNeighbors_1 = require("./countyNeighbors");
 const entityResolve_1 = require("./entityResolve");
 const rankModel_1 = require("./rankModel");
 const rankingsStore_1 = require("./rankingsStore");
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.answerRank = answerRank;
+exports.conversationCounty = conversationCounty;
 exports.looksLikeRankQuestion = looksLikeRankQuestion;
 exports.rankOptions = rankOptions;
 exports.resetRankSessions = resetRankSessions;
 exports.interpretRankMessage = interpretRankMessage;
 exports.refusesWrite = refusesWrite;
+
+const payorName = zod_1.z.string().trim().min(1, 'payor is required').max(200);
+const planTypeName = zod_1.z.string().trim().min(1, 'planType is required').max(25);
+const rankRequestSchema = zod_1.z.object({
+    question: zod_1.z.string().max(500, 'question must be at most 500 characters').transform((value) => value.trim()).pipe(zod_1.z.string().min(1, 'question is required')),
+    payors: zod_1.z.array(payorName, { error: 'payors is required' }).min(1, 'payors is required'),
+    payorsCrossPlanTypes: zod_1.z.array(zod_1.z.object({
+        payor: payorName,
+        planType: planTypeName,
+    }), { error: 'payors cross planTypes is required' }).min(1, 'payors cross planTypes is required'),
+    context: zod_1.z.object({
+        county: zod_1.z.string().trim().max(200).optional(),
+        state: zod_1.z.string().trim().max(200).optional(),
+        system: zod_1.z.string().trim().max(200).optional(),
+    }).optional(),
+}).superRefine((value, ctx) => {
+    const listed = new Set(value.payors.map((payor) => payor.toLowerCase()));
+    const covered = new Set();
+    const seenPairs = new Set();
+    const seenPayors = new Set();
+    value.payors.forEach((payor, index) => {
+        const key = payor.toLowerCase();
+        if (seenPayors.has(key)) {
+            ctx.addIssue({ code: 'custom', path: ['payors', index], message: `duplicate payor "${payor}"` });
+        }
+        seenPayors.add(key);
+    });
+    value.payorsCrossPlanTypes.forEach((pair, index) => {
+        const payorKey = pair.payor.toLowerCase();
+        if (!listed.has(payorKey)) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['payorsCrossPlanTypes', index, 'payor'],
+                message: `payor "${pair.payor}" must be listed in payors`,
+            });
+        }
+        else covered.add(payorKey);
+        const pairKey = `${payorKey}|${pair.planType.toLowerCase()}`;
+        if (seenPairs.has(pairKey)) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['payorsCrossPlanTypes', index],
+                message: `duplicate payor and planType "${pair.payor}" / "${pair.planType}"`,
+            });
+        }
+        seenPairs.add(pairKey);
+    });
+    value.payors.forEach((payor, index) => {
+        if (!covered.has(payor.toLowerCase())) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['payors', index],
+                message: `payor "${payor}" needs at least one planType in payorsCrossPlanTypes`,
+            });
+        }
+    });
+    const state = value.context?.state;
+    if (state && !/^(tx|texas)$/i.test(state)) {
+        ctx.addIssue({ code: 'custom', path: ['context', 'state'], message: 'only Texas data is available' });
+    }
+});
+
+function formatRankIssues(error) {
+    return error.issues.map((issue) => {
+        const field = issue.path.length ? issue.path.map(String).join('.') : 'body';
+        return `${field}: ${issue.message}`;
+    }).join('; ');
+}
 
 const sessions = new Map();
 const METHOD = 'Rank is 1 plus the number of competitors with a strictly higher metric. Marginal reach = entity reach × (1 − overlap) × (1 − focal share of geography reach), rounded to the nearest beneficiary. Competitor metrics stay fixed. Rank changes only when the new metric passes a competitor, so the move is not proportional to the size of the change.';
@@ -496,6 +565,12 @@ function loadDeps(deps) {
     return (0, rankingsStore_1.loadRankData)(directory);
 }
 
+/** County named in this chat turn, using the same county list the rank answer uses. */
+function conversationCounty(message, earlier, deps) {
+    const counties = knownCounties(loadDeps(deps).rankings);
+    return resolveCounty(message, counties) || countyLines(earlier, counties) || '';
+}
+
 function uniqueSorted(values) {
     return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
@@ -504,7 +579,8 @@ function uniqueSorted(values) {
 function rankOptions(input = {}, deps) {
     const data = loadDeps(deps);
     const counties = knownCounties(data.rankings);
-    const rawCounty = String(input.county || resolveCounty(input.q || input.message || '', counties) || '').trim();
+    const fromQuestion = resolveCounty(input.q || input.message || '', counties);
+    const rawCounty = String(fromQuestion || input.county || '').trim();
     const county = counties.get(countyKey(rawCounty)) || rawCounty;
     const planType = String(input.planType || '').trim();
     let rows = (data.rankings || []).filter((row) => (row.state || 'TX').toUpperCase() === 'TX');
@@ -525,14 +601,14 @@ async function answerRank(input, deps) {
     if (refusesWrite(message)) {
         return { kind: 'refused', answer: "I can't change the network tables. Ask a read-only rank question." };
     }
-    const scope = askService_1.askRequestSchema.safeParse({
+    const scope = rankRequestSchema.safeParse({
         question: (message || 'rank').slice(0, 500),
         payors: input.payors,
         payorsCrossPlanTypes: input.payorsCrossPlanTypes,
         context: input.geography || input.context,
     });
     if (!scope.success) {
-        return { status: 400, kind: 'error', answer: (0, askService_1.formatAskIssues)(scope.error) };
+        return { status: 400, kind: 'error', answer: formatRankIssues(scope.error) };
     }
     const data = loadDeps(deps);
     const previous = input.sessionId ? sessions.get(input.sessionId) : null;
