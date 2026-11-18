@@ -31,10 +31,10 @@ const blocked = (sql, why) => {
 });
 (0, node_test_1.test)('allows CTEs, CAST joins, window functions, three-part names in the right database', () => {
     ok("WITH a AS (SELECT DISTINCT pl.NPI FROM ProviderLocation pl WHERE pl.FIPS = '48113') SELECT COUNT(*) FROM a");
-    ok('SELECT hd.HosptitalName FROM ProviderHospitalAffiliation pha JOIN HospitalDetails hd ON hd.HospitalNPI = CAST(pha.HospitalNPI AS varchar(10))');
-    ok('SELECT c.FIPS, ROW_NUMBER() OVER (PARTITION BY c.StateCode ORDER BY c.FIPS) rn FROM County c');
-    ok('SELECT COUNT(*) FROM NI_hackathon_data.dbo.County');
-    ok('```sql\nSELECT TOP 5 * FROM County;\n```');
+    ok("SELECT hd.HosptitalName FROM ProviderHospitalAffiliation pha JOIN HospitalDetails hd ON hd.HospitalNPI = CAST(pha.HospitalNPI AS varchar(10)) WHERE hd.FIPS LIKE '48%'");
+    ok("SELECT c.FIPS, ROW_NUMBER() OVER (PARTITION BY c.StateCode ORDER BY c.FIPS) rn FROM County c WHERE c.StateCode = 'TX'");
+    ok("SELECT COUNT(*) FROM NI_hackathon_data.dbo.County WHERE StateCode = 'TX'");
+    ok("```sql\nSELECT TOP 5 * FROM County WHERE StateCode = 'TX';\n```");
 });
 (0, node_test_1.test)('values that look like keywords inside strings are fine', () => {
     ok("SELECT * FROM ParentOrganization WHERE ParentOrganizationName LIKE '%Insert Health; DROP%'");
@@ -67,9 +67,20 @@ const blocked = (sql, why) => {
 });
 (0, node_test_1.test)('comments are stripped before checks and execution', () => {
     strict_1.default.equal((0, sqlGuard_1.stripComments)("SELECT 1 -- DROP TABLE x\nFROM County /* hi */").replace(/\s+/g, ' ').trim(), 'SELECT 1 FROM County');
-    const r = ok('SELECT TOP 1 * FROM County -- ; DROP TABLE County');
+    const r = ok("SELECT TOP 1 * FROM County WHERE StateCode = 'TX' -- ; DROP TABLE County");
     strict_1.default.ok(!r.sql.includes('DROP'));
     strict_1.default.equal((0, sqlGuard_1.stripComments)("SELECT '--not a comment' FROM County"), "SELECT '--not a comment' FROM County");
+});
+(0, node_test_1.test)('geographic queries are limited to Texas', () => {
+    ok("SELECT * FROM County WHERE StateCode = 'TX'");
+    ok("SELECT * FROM GeographyPlanFilters WHERE FIPS LIKE '48%'");
+    ok("SELECT * FROM ProviderLocation WHERE FIPS IN ('48113', '48201')");
+    ok('SELECT PlanType FROM PlanType');
+    blocked('SELECT * FROM County', /Texas/);
+    blocked("SELECT * FROM County WHERE StateCode = 'CA'", /Texas/);
+    blocked("SELECT * FROM County WHERE StateCode IN ('TX', 'OK')", /Texas/);
+    blocked("SELECT * FROM ProviderLocation WHERE FIPS = '06037'", /Texas/);
+    blocked("SELECT * FROM MilesIndividual_30 WHERE Isochrone_FIPS LIKE '48%' AND NPI_FIPS = '40109'", /Texas/);
 });
 (0, node_test_1.test)('unsupported syntax fails closed with a hint the LLM can act on', () => {
     blocked('SELECT FIPS FROM County EXCEPT SELECT FIPS FROM ProviderLocation', /NOT EXISTS/);

@@ -46,6 +46,13 @@ function fakeLive() {
     console.log(`prompt chars=${prompt.length} (~${approxTokens} tokens), tables=${ctx.tables.length}`);
     strict_1.default.ok(approxTokens < 12000);
 });
+(0, node_test_1.test)('chat answers stay on provider networks', () => {
+    const prompt = (0, prompts_1.networkChatSystemPrompt)('You are a helpful assistant.');
+    strict_1.default.match(prompt, /provider networks/);
+    strict_1.default.match(prompt, /Houston County, Texas/);
+    strict_1.default.match(prompt, /in-network providers, hospitals, or enrollment/);
+    strict_1.default.match(prompt, /Caller instructions:\nYou are a helpful assistant\./);
+});
 (0, node_test_1.test)('parses model JSON, with or without a code fence', () => {
     strict_1.default.equal((0, prompts_1.parseSqlDraft)('```json\n{"sql":"SELECT 1","explanation":"x","assumptions":["TX"]}\n```')?.assumptions[0], 'TX');
     strict_1.default.equal((0, prompts_1.parseSqlDraft)('not json'), null);

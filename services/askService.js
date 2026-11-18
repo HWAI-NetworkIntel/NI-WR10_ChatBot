@@ -19,15 +19,93 @@ const prompts_1 = require("./prompts");
 const sqlGuard_1 = require("../utils/sqlGuard");
 const schemaContext_1 = require("../utils/schemaContext");
 exports.ASK_ERROR_MESSAGE = "I couldn't build a valid query for that. Try naming the payer, county or specialty.";
+const payorName = zod_1.z.string().trim().min(1, 'payor is required').max(200);
+const planTypeName = zod_1.z.string().trim().min(1, 'planType is required').max(25);
+const payorPlanTypeSchema = zod_1.z.object({
+    payor: payorName,
+    planType: planTypeName,
+});
 exports.askRequestSchema = zod_1.z.object({
     question: zod_1.z.string().max(500, 'question must be at most 500 characters').transform((value) => value.trim()).pipe(zod_1.z.string().min(1, 'question is required')),
+    payors: zod_1.z.array(payorName, { error: 'payors is required' }).min(1, 'payors is required'),
+    payorsCrossPlanTypes: zod_1.z.array(payorPlanTypeSchema, { error: 'payors cross planTypes is required' }).min(1, 'payors cross planTypes is required'),
     context: zod_1.z.object({
-        payer: zod_1.z.string().trim().max(200).optional(),
         county: zod_1.z.string().trim().max(200).optional(),
         state: zod_1.z.string().trim().max(200).optional(),
         system: zod_1.z.string().trim().max(200).optional(),
     }).optional(),
+}).superRefine((value, ctx) => {
+    const listed = new Map(value.payors.map((payor) => [payor.toLowerCase(), payor]));
+    const covered = new Set();
+    const seenPairs = new Set();
+    const seenPayors = new Set();
+    value.payors.forEach((payor, index) => {
+        const key = payor.toLowerCase();
+        if (seenPayors.has(key)) {
+            ctx.addIssue({ code: 'custom', path: ['payors', index], message: `duplicate payor "${payor}"` });
+        }
+        seenPayors.add(key);
+    });
+    value.payorsCrossPlanTypes.forEach((pair, index) => {
+        const payorKey = pair.payor.toLowerCase();
+        if (!listed.has(payorKey)) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['payorsCrossPlanTypes', index, 'payor'],
+                message: `payor "${pair.payor}" must be listed in payors`,
+            });
+        }
+        else {
+            covered.add(payorKey);
+        }
+        const pairKey = `${payorKey}|${pair.planType.toLowerCase()}`;
+        if (seenPairs.has(pairKey)) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['payorsCrossPlanTypes', index],
+                message: `duplicate payor and planType "${pair.payor}" / "${pair.planType}"`,
+            });
+        }
+        seenPairs.add(pairKey);
+    });
+    value.payors.forEach((payor, index) => {
+        if (!covered.has(payor.toLowerCase())) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['payors', index],
+                message: `payor "${payor}" needs at least one planType in payorsCrossPlanTypes`,
+            });
+        }
+    });
+    const state = value.context?.state;
+    if (state && !/^(tx|texas)$/i.test(state)) {
+        ctx.addIssue({ code: 'custom', path: ['context', 'state'], message: 'only Texas data is available' });
+    }
 });
+/** Tables that carry a payor and the payor × plan type cross. */
+const SCOPE_TABLES = ['ParentOrganization', 'GeographyPlanFilters', 'PlanType'];
+function sqlIncludes(sql, value) {
+    return sql.toLowerCase().includes(value.toLowerCase().replace(/'/g, "''"));
+}
+/** Reject SQL that is not limited to the request's payors and payor × plan type pairs. */
+function payorScopeIssue(sql, tables, input) {
+    const have = new Set(tables.map((table) => table.toLowerCase()));
+    const missingTables = SCOPE_TABLES.filter((table) => !have.has(table.toLowerCase()));
+    const missingPayors = input.payors.filter((payor) => !sqlIncludes(sql, payor));
+    const planTypes = [...new Set(input.payorsCrossPlanTypes.map((pair) => pair.planType))];
+    const missingPlanTypes = planTypes.filter((planType) => !sqlIncludes(sql, planType));
+    if (!missingTables.length && !missingPayors.length && !missingPlanTypes.length)
+        return '';
+    const parts = ['Every query must filter to the required payors and the payor × plan type cross (ParentOrganization JOIN GeographyPlanFilters JOIN PlanType).'];
+    if (missingTables.length)
+        parts.push(`Missing tables: ${missingTables.join(', ')}.`);
+    if (missingPayors.length)
+        parts.push(`Missing payor filters: ${missingPayors.join(', ')}.`);
+    if (missingPlanTypes.length)
+        parts.push(`Missing plan type filters: ${missingPlanTypes.join(', ')}.`);
+    parts.push('Keep each payor only for the plan types paired with it.');
+    return parts.join(' ');
+}
 let cachedExamples = null;
 function loadExamples() {
     if (cachedExamples)
@@ -77,14 +155,26 @@ function templateAnswer(columns, rows) {
 function scenarioLine(context) {
     if (!context)
         return '';
-    const parts = ['payer', 'county', 'state', 'system']
+    const parts = ['county', 'state', 'system']
         .filter((key) => context[key])
         .map((key) => `${key}=${context[key]}`);
     return parts.length ? `Current scenario: ${parts.join(', ')}` : '';
 }
+function scopeLine(input) {
+    const pairs = input.payorsCrossPlanTypes.map((pair) => `${pair.payor} × ${pair.planType}`).join('; ');
+    return [
+        `Required payors: ${input.payors.join(', ')}`,
+        `Required payors cross plan types: ${pairs}`,
+        'Required state: TX. Only Texas rows are allowed (StateCode = \'TX\' or FIPS LIKE \'48%\').',
+        'Payors, the payor × plan type cross, and Texas are mandatory.',
+    ].join('\n');
+}
 function userText(input) {
+    const parts = [input.question, scopeLine(input)];
     const line = scenarioLine(input.context);
-    return line ? `${input.question}\n${line}` : input.question;
+    if (line)
+        parts.push(line);
+    return parts.join('\n');
 }
 function referencesFor(tables, schema) {
     const byName = new Map(schema.tables.map((table) => [table.table.toLowerCase(), table.description]));
@@ -165,15 +255,16 @@ async function answerQuestion(input, deps = createDefaultDeps()) {
             return { kind: 'cannot_answer', explanation: draft.explanation };
         }
         const guard = (0, sqlGuard_1.guardSql)(draft.sql, { allowedTables: deps.schema.allowedTables, database: deps.database });
-        if (!guard.ok) {
-            lastSql = draft.sql;
-            lastGuard = guard.reason;
-            lastError = guard.reason;
+        const scopeIssue = guard.ok ? payorScopeIssue(guard.sql, guard.tables, input) : '';
+        if (!guard.ok || scopeIssue) {
+            lastSql = guard.ok ? guard.sql : draft.sql;
+            lastGuard = guard.ok ? scopeIssue : guard.reason;
+            lastError = lastGuard;
             if (attempt === 0) {
                 messages = [
                     { role: 'user', content: questionText },
                     { role: 'assistant', content: raw },
-                    { role: 'user', content: (0, prompts_1.repairMessage)(draft.sql, guard.reason) },
+                    { role: 'user', content: (0, prompts_1.repairMessage)(lastSql, lastError) },
                 ];
                 continue;
             }

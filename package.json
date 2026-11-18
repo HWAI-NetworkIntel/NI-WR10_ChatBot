@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test test/askService.test.js test/eval.test.js test/examples.test.js test/llm.test.js test/schemaContext.test.js test/sqlGuard.test.js",
+    "test": "node --test test/askService.test.js test/eval.test.js test/examples.test.js test/llm.test.js test/rank.test.js test/schemaContext.test.js test/sqlGuard.test.js",
     "eval": "node scripts/eval.js"
   },
   "dependencies": {

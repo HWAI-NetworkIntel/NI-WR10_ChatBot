@@ -136,5 +136,67 @@ function guardSql(input, options) {
     if (used.size === 0 && entries.length === 0 && /\bFROM\b/i.test(code)) {
         return { ok: false, reason: 'Could not identify the tables in the query.' };
     }
+    const texas = texasScopeIssue(sql, used);
+    if (texas)
+        return { ok: false, reason: texas };
     return { ok: true, sql, tables: [...used].sort() };
+}
+/** Tables whose rows are tied to a state or county. Lookup tables with no geography are not listed. */
+const GEO_TABLES = new Set([
+    'providerscoredetails', 'languagegeographymapping', 'providerlocation', 'hospitaldetails',
+    'state', 'county', 'enrollmentdetails', 'milesindividual_10', 'mileshospital_10',
+    'networkcountbyfips', 'mileshospital_30', 'networkcountbyzip', 'milesindividual_30',
+    'mileshospital_60', 'milesindividual_60', 'provideraddresscount', 'geographyplanfilters',
+    'npiquickfiltermapping',
+]);
+const TEXAS_REASON = 'Only Texas data is available. Filter geographic tables with StateCode = \'TX\' or FIPS / NPI_FIPS / Isochrone_FIPS LIKE \'48%\'. Do not query any other state.';
+function quotedValues(text) {
+    return [...text.matchAll(/N?'([^']*(?:''[^']*)*)'/gi)].map((match) => match[1].replace(/''/g, "'"));
+}
+function isTexasFips(value) {
+    return /^48[%_\d]*$/.test(value);
+}
+/** Reject geographic queries that are not limited to Texas, and any explicit non-Texas state or FIPS. */
+function texasScopeIssue(sql, tables) {
+    const readsGeography = [...tables].some((table) => GEO_TABLES.has(String(table).toLowerCase()));
+    let texas = false;
+    let otherState = false;
+    for (const match of sql.matchAll(/\[?StateCode\]?\s*=\s*N?'([A-Za-z]{2})'/gi)) {
+        if (match[1].toUpperCase() === 'TX')
+            texas = true;
+        else
+            otherState = true;
+    }
+    for (const match of sql.matchAll(/\[?StateCode\]?\s+IN\s*\(([^)]*)\)/gi)) {
+        const codes = quotedValues(match[1]).map((value) => value.toUpperCase());
+        if (codes.length === 1 && codes[0] === 'TX')
+            texas = true;
+        else if (codes.length)
+            otherState = true;
+    }
+    if (/\[?StateCode\]?\s*(?:<>|!=|LIKE|NOT\s+LIKE)\s*N?'/i.test(sql))
+        otherState = true;
+    for (const match of sql.matchAll(/\[?StateName\]?\s*=\s*N?'([^']*)'/gi)) {
+        if (/^texas$/i.test(match[1]))
+            texas = true;
+        else
+            otherState = true;
+    }
+    let otherFips = false;
+    for (const match of sql.matchAll(/\[?(?:NPI_FIPS|Isochrone_FIPS|FIPS)\]?\s*(=|<>|!=|LIKE|NOT\s+LIKE|IN)\s*(N?'(?:[^']|'')*'|\([^)]*\))/gi)) {
+        const operator = match[1].toUpperCase().replace(/\s+/g, ' ');
+        const values = quotedValues(match[2]);
+        if (operator === '=' || operator === 'LIKE' || operator === 'IN') {
+            if (values.length && values.every(isTexasFips))
+                texas = true;
+            else
+                otherFips = true;
+        }
+        else {
+            otherFips = true;
+        }
+    }
+    if (otherState || otherFips || (readsGeography && !texas))
+        return TEXAS_REASON;
+    return '';
 }

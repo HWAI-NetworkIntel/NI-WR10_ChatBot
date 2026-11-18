@@ -1,0 +1,592 @@
+"use strict";
+/**
+ * Multi-turn rank movement.
+ * Confirm the health system or group before predicting. Competitors stay fixed.
+ */
+const node_crypto_1 = require("node:crypto");
+const node_path_1 = require("node:path");
+const askService_1 = require("./askService");
+const countyNeighbors_1 = require("./countyNeighbors");
+const entityResolve_1 = require("./entityResolve");
+const rankModel_1 = require("./rankModel");
+const rankingsStore_1 = require("./rankingsStore");
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.answerRank = answerRank;
+exports.looksLikeRankQuestion = looksLikeRankQuestion;
+exports.resetRankSessions = resetRankSessions;
+exports.interpretRankMessage = interpretRankMessage;
+exports.refusesWrite = refusesWrite;
+
+const sessions = new Map();
+const METHOD = 'Rank is 1 plus the number of competitors with a strictly higher metric. Marginal reach = entity reach × (1 − overlap) × (1 − focal share of geography reach), rounded to the nearest beneficiary. Competitor metrics stay fixed. Rank changes only when the new metric passes a competitor, so the move is not proportional to the size of the change.';
+
+function resetRankSessions() {
+    sessions.clear();
+}
+
+function looksLikeRankQuestion(text) {
+    return /\brank\b|terminat|health system|physician group|where do we (?:land|rank)|if we (?:add|remove|drop|terminate)|adjacent count|surrounding count|best network|against payer|small groups/i.test(String(text || ''));
+}
+
+function refusesWrite(text) {
+    return /\b(ignore (?:your|all|previous|the) rules|update\s+(?:the\s+)?[\w]+|delete\s+from|drop\s+table|insert\s+into|alter\s+table|truncate\s+table)\b/i.test(String(text || ''));
+}
+
+function countyKey(value) {
+    return String(value || '').toLowerCase().replace(/\bcounty\b/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function samePlace(row, county) {
+    if ((row.state || 'TX').toUpperCase() !== 'TX') return false;
+    return countyKey(row.county) === countyKey(county);
+}
+
+function payorKey(value) {
+    return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function matchPayor(name, rows) {
+    const key = payorKey(name);
+    const names = [...new Set(rows.map((row) => row.payor))];
+    const exact = names.find((payor) => payorKey(payor) === key);
+    if (exact) return exact;
+    const partial = names.filter((payor) => payorKey(payor).includes(key) || key.includes(payorKey(payor)));
+    return partial.length === 1 ? partial[0] : null;
+}
+
+function latestAsOf(rows) {
+    const dates = rows.map((row) => row.asOf).filter(Boolean).sort();
+    return dates.at(-1) || null;
+}
+
+function comma(value) {
+    return Math.round(value).toLocaleString('en-US');
+}
+
+function baseAssumptions(metric, asOf, overlapNote) {
+    return [
+        'Competitor networks are held constant unless you name a competitor change.',
+        METHOD,
+        `The metric is ${metric}${asOf ? `, roster as of ${asOf}` : ''}.`,
+        'The geography is Texas. The county name selects the slice.',
+        'Values for the same payor, county, and plan type are summed.',
+        overlapNote,
+    ];
+}
+
+function overlapFor(entity, focalPayor, competitorPayors) {
+    if (entity.overlap != null) return { overlap: entity.overlap, overlapSource: 'roster file' };
+    const owner = payorKey(entity.payor);
+    if (owner && owner === payorKey(focalPayor)) return { overlap: rankModel_1.DEFAULT_OVERLAP.onFocal, overlapSource: 'default for an entity already on the focal roster' };
+    if (owner && competitorPayors.some((payor) => payorKey(payor) === owner)) return { overlap: rankModel_1.DEFAULT_OVERLAP.onCompetitor, overlapSource: 'default for an entity on a competitor roster' };
+    return { overlap: rankModel_1.DEFAULT_OVERLAP.unaffiliated, overlapSource: 'default for an unaffiliated entity' };
+}
+
+function aggregate(rows, focalName) {
+    const byPayor = new Map();
+    for (const row of rows) {
+        const current = byPayor.get(row.payor) ?? { payor: row.payor, value: 0, networks: [] };
+        current.value += row.value;
+        if (row.network) current.networks.push(row.network);
+        byPayor.set(row.payor, current);
+    }
+    const focal = byPayor.get(focalName);
+    const competitors = [...byPayor.values()].filter((row) => row.payor !== focalName);
+    return { focal, competitors };
+}
+
+function extractCounty(message) {
+    const match = String(message || '').match(/\b(?:in|for|within)\s+([A-Za-z][A-Za-z .'-]*?)\s+county\b/i);
+    return match ? match[1].trim() : '';
+}
+
+function countWord(value) {
+    const words = { one: 1, two: 2, three: 3, four: 4, five: 5 };
+    const key = String(value || '').toLowerCase();
+    return words[key] || Number(key);
+}
+
+function extractSmallGroups(message) {
+    const match = /\b(?:drop|remove|terminate)\s+(?:these\s+|the\s+)?(one|two|three|four|five|\d+)\s+small\s+groups\b/i.exec(message);
+    return match ? countWord(match[1]) : null;
+}
+
+function extractSubjectTermination(message) {
+    const match = /\b(?:if|what if)\s+(.+?)\s+(?:terminates|terminated|terminate|drops|leaves|exits)\b/i.exec(message);
+    if (!match) return null;
+    const phrase = (0, entityResolve_1.cleanEntityPhrase)(match[1].replace(/^(?:we|our network|our)\s+/i, ''));
+    if (!phrase || /^(we|our)$/i.test(phrase)) return null;
+    return { action: 'remove', phrase };
+}
+
+function extractChange(message) {
+    if (extractSmallGroups(message)) return null;
+    const subject = extractSubjectTermination(message);
+    if (subject) return subject;
+    const add = /\b(?:add|adding|admit|include|including|contract(?:ing)? with|bring in|affiliate with)\s+(.+?)(?=\s+(?:in|for|into|to rank|where|and where)\b|[?.!,]|$)/i.exec(message);
+    if (add && !/^(to|toward|towards)\b/i.test(add[1].trim())) return { action: 'add', phrase: (0, entityResolve_1.cleanEntityPhrase)(add[1]) };
+    const remove = /\b(?:termination of|terminating|terminate|removing|remove|dropping|drop|without|losing|lose|exit)\s+(.+?)(?=\s+(?:in|from|for|where|its\b)\b|[?.!,]|$)/i.exec(message);
+    if (remove) return { action: 'remove', phrase: (0, entityResolve_1.cleanEntityPhrase)(remove[1]) };
+    return null;
+}
+
+function extractTarget(message) {
+    const match = /\b(?:reach|hit|get to)\s+rank\s+(\d+)\b|\bto\s+rank\s+(\d+)\b/i.exec(message);
+    if (!match) return null;
+    if (/\bhow close\b/i.test(message)) return null;
+    if (!/\b(reach|hit|get to|adds?|additions?|smallest set|what should we add|which additions)\b/i.test(message)) return null;
+    return Number(match[1] || match[2]);
+}
+
+function extractCloseRank(message) {
+    const match = /\bhow close\b[\s\S]{0,60}\brank\s+(\d+)\b/i.exec(message);
+    return match ? Number(match[1]) : null;
+}
+
+function extractAgainst(message) {
+    const match = /\bagainst\s+(?:payer\s+)?["']?([A-Za-z0-9][A-Za-z0-9 .&'-]*?)["']?(?=\s+in\b|[?.!]|$)/i.exec(message);
+    return match ? match[1].trim() : '';
+}
+
+function interpretRankMessage(message, session) {
+    const text = String(message || '').trim();
+    const county = extractCounty(text) || session?.county || '';
+    const smallGroups = extractSmallGroups(text);
+    const change = extractChange(text);
+    const targetRank = extractTarget(text);
+    const closeRank = extractCloseRank(text);
+    const against = extractAgainst(text);
+    const safeRemoval = /\brank-safe\b|\bsafe to (?:remove|drop|terminate)\b|\bwhich removals\b/i.test(text);
+    const sensitivity = /\bhow close\b|\bsensitivity\b|\bboundary\b|\bhow much .{0,40}reach\b/i.test(text);
+    const spread = /\badjacent counties\b|\bsurrounding counties\b|\bhold across\b|\bacross the surrounding\b/i.test(text);
+    const recap = /\bhow much rank did we lose\b|\brank did we lose\b/i.test(text);
+    const best = /\bbest network\b/i.test(text);
+    const affirm = /^(yes|yep|yeah|confirm|go ahead|use that|that one)\b/i.test(text) || /\brank after that\b|\bafter that\b/i.test(text);
+    let intent = 'baseline';
+    if (spread) intent = 'geography';
+    else if (recap && !change) intent = 'recap';
+    else if (smallGroups) intent = 'predict';
+    else if (safeRemoval) intent = 'safe_removals';
+    else if (best) intent = 'best';
+    else if (against) intent = 'against';
+    else if (sensitivity) intent = 'sensitivity';
+    else if (targetRank && !change) intent = 'prescribe';
+    else if (change) intent = 'predict';
+    return { text, county, change, smallGroups, targetRank, closeRank, against, intent, affirm };
+}
+
+function sliceRows(rankings, county, planType) {
+    return rankings.filter((row) => samePlace(row, county) && row.planType.toLowerCase() === planType.toLowerCase() && row.state === 'TX');
+}
+
+function catalogFor(roster, county, planType) {
+    return roster
+        .filter((row) => samePlace(row, county) && (!row.planType || row.planType.toLowerCase() === planType.toLowerCase()))
+        .map((row) => ({ ...row, source: 'roster' }));
+}
+
+function chooseFocal(message, scope, rankings) {
+    const payors = scope.payors;
+    const mentioned = payors.filter((payor) => message.toLowerCase().includes(payor.toLowerCase()));
+    const payor = mentioned.length === 1 ? mentioned[0] : payors.length === 1 ? payors[0] : null;
+    if (!payor) return { clarify: `Which payor is "we"? Choose one of ${payors.join(', ')}.` };
+    const pairs = scope.payorsCrossPlanTypes.filter((pair) => pair.payor.toLowerCase() === payor.toLowerCase());
+    const mentionedType = pairs.filter((pair) => message.toLowerCase().includes(pair.planType.toLowerCase()));
+    const planType = mentionedType.length === 1 ? mentionedType[0].planType : pairs.length === 1 ? pairs[0].planType : null;
+    if (!planType) return { clarify: `Which plan type for ${payor}? Choose one of ${pairs.map((pair) => pair.planType).join(', ')}.` };
+    const known = matchPayor(payor, rankings);
+    return { payor, planType, rankingsPayor: known };
+}
+
+function remember(previous, patch) {
+    const id = previous?.id || (0, node_crypto_1.randomUUID)();
+    const next = { ...previous, ...patch, id };
+    sessions.set(id, next);
+    if (sessions.size > 200) sessions.delete(sessions.keys().next().value);
+    return next;
+}
+
+function entityRecord(match, focalPayor, competitorPayors) {
+    const overlap = overlapFor(match, focalPayor, competitorPayors);
+    return {
+        name: match.name,
+        entityType: match.entityType,
+        reach: match.reach,
+        payor: match.payor || '',
+        onFocal: payorKey(match.payor) === payorKey(focalPayor),
+        ...overlap,
+    };
+}
+
+function driversFor(result, metric) {
+    return result.applied.map((change) => {
+        const direction = change.marginalReach < 0 ? 'gives up' : 'adds';
+        return `${change.action === 'remove' ? 'Removing' : 'Adding'} ${change.name} ${direction} ${comma(Math.abs(change.marginalReach))} ${metric}. The roster reach is ${comma(change.reach)}; overlap ${change.overlap} and current coverage leave only that marginal share.`;
+    });
+}
+
+function answerFromPrediction(session, result, metric, asOf, assumptions, extra) {
+    const actionWord = result.applied.every((change) => change.action === 'remove')
+        ? 'termination'
+        : result.applied.every((change) => change.action === 'add') ? 'addition' : 'change';
+    const phrase = (0, rankModel_1.movementPhrase)(result.baseline.rank, result.predicted.rank, actionWord);
+    const lost = result.applied.filter((change) => change.marginalReach < 0).reduce((sum, change) => sum + Math.abs(change.marginalReach), 0);
+    const gained = result.applied.filter((change) => change.marginalReach > 0).reduce((sum, change) => sum + change.marginalReach, 0);
+    const above = result.margin.above ? `${comma(result.margin.above.reach)} ${metric} behind ${result.margin.above.payor}` : 'no network above';
+    const below = result.margin.below ? `${comma(result.margin.below.reach)} ${metric} ahead of ${result.margin.below.payor}` : 'no network below';
+    const absorbed = result.predicted.movement === 0 && lost > 0
+        ? `Beneficiary reach lost is ${comma(lost)}, and the margin absorbs it, so the rank does not move.`
+        : '';
+    const reachLine = lost > 0 ? `Beneficiary reach lost: ${comma(lost)}.` : gained > 0 ? `Beneficiary reach gained: ${comma(gained)}.` : '';
+    const answer = [
+        phrase,
+        reachLine,
+        `Margin after the change: ${above}; ${below}.`,
+        absorbed,
+        extra || '',
+    ].filter(Boolean).join(' ');
+    return answer;
+}
+
+function baselineBody(session, pack, assumptions) {
+    const { focal, competitors, metric, asOf } = pack;
+    const result = (0, rankModel_1.predictChange)({ focal, competitors, changes: [] });
+    const gap = result.baseline.reachToNextBetterRank;
+    const cushion = result.baseline.reachBeforeWorseRank;
+    const answer = [
+        `${focal.payor} ${session.planType} is rank ${result.baseline.rank} of ${result.baseline.of} in ${session.county} County, Texas, on ${metric}${asOf ? ` as of ${asOf}` : ''}.`,
+        `The competitor set is ${[focal, ...competitors].map((row) => row.payor).join(', ')}.`,
+        gap == null ? 'There is no network above.' : `${comma(gap)} ${metric} separates it from ${result.baseline.nextBetter.payor}.`,
+        cushion == null ? 'There is no network below.' : `${comma(cushion)} ${metric} can be lost before it ties ${result.baseline.nextWorse.payor}.`,
+    ].join(' ');
+    return {
+        kind: 'baseline',
+        answer,
+        geography: { county: session.county, state: 'TX' },
+        focal: { payor: focal.payor, planType: session.planType },
+        metric,
+        asOf,
+        competitorSet: competitors.map((row) => row.payor),
+        baseline: result.baseline,
+        sensitivity: {
+            reachToNextBetterRank: result.baseline.reachToNextBetterRank,
+            reachBeforeWorseRank: result.baseline.reachBeforeWorseRank,
+        },
+        standings: (0, rankModel_1.standings)(focal, competitors),
+        assumptions,
+        method: METHOD,
+    };
+}
+
+function scoreCounty(data, county, planType, payor, metric, scenario) {
+    const slice = sliceRows(data.rankings, county, planType).filter((row) => row.metric === metric);
+    if (!slice.length) return { county, status: 'missing_rankings' };
+    const rankingsPayor = matchPayor(payor, slice);
+    if (!rankingsPayor) return { county, status: 'missing_roster' };
+    const { focal, competitors } = aggregate(slice, rankingsPayor);
+    if (!focal) return { county, status: 'missing_roster' };
+    const catalog = catalogFor(data.roster, county, planType).map((row) => entityRecord(row, rankingsPayor, competitors.map((item) => item.payor)));
+    const changes = [];
+    for (const item of scenario) {
+        const match = catalog.find((row) => (0, entityResolve_1.normalizeName)(row.name) === (0, entityResolve_1.normalizeName)(item.name));
+        if (!match) return { county, status: 'missing_roster' };
+        changes.push({ action: item.action, name: match.name, entityType: match.entityType, reach: match.reach, overlap: match.overlap });
+    }
+    const result = (0, rankModel_1.predictChange)({ focal, competitors, changes });
+    const reachLost = result.applied.filter((change) => change.marginalReach < 0).reduce((sum, change) => sum + Math.abs(change.marginalReach), 0);
+    return {
+        county,
+        status: 'ok',
+        rankToday: result.baseline.rank,
+        rankAfter: result.predicted.rank,
+        reachLost,
+        holds: result.baseline.rank === result.predicted.rank,
+        margin: result.margin,
+    };
+}
+
+function finishPrediction(session, result, metric, asOf, assumptions, extra, geography) {
+    const answer = answerFromPrediction(session, result, metric, asOf, assumptions, extra);
+    const reachLost = result.applied.filter((change) => change.marginalReach < 0).reduce((sum, change) => sum + Math.abs(change.marginalReach), 0);
+    const payload = {
+        kind: 'prediction',
+        answer,
+        geography: geography || { county: session.county, state: 'TX' },
+        focal: { payor: session.payor, planType: session.planType },
+        metric,
+        asOf,
+        competitorSet: result.standings.filter((row) => !row.focal).map((row) => row.payor),
+        baseline: result.baseline,
+        predicted: result.predicted,
+        margin: result.margin,
+        reachLost,
+        sensitivity: {
+            reachToNextBetterRank: result.baseline.reachToNextBetterRank,
+            reachBeforeWorseRank: result.baseline.reachBeforeWorseRank,
+        },
+        change: result.applied,
+        drivers: driversFor(result, metric),
+        standings: result.standings,
+        assumptions,
+        method: METHOD,
+    };
+    const saved = remember(session, {
+        lastChange: result.applied.map((change) => ({ action: change.action, name: change.name })),
+        lastPrediction: payload,
+    });
+    return { ...payload, sessionId: saved.id };
+}
+
+function loadDeps(deps) {
+    if (deps) return deps;
+    const directory = (0, node_path_1.join)(__dirname, '..', 'data');
+    return (0, rankingsStore_1.loadRankData)(directory);
+}
+
+async function answerRank(input, deps) {
+    const message = String(input.message || input.question || '').trim();
+    if (refusesWrite(message)) {
+        return { kind: 'refused', answer: "I can't change the network tables. Ask a read-only rank question." };
+    }
+    const scope = askService_1.askRequestSchema.safeParse({
+        question: (message || 'rank').slice(0, 500),
+        payors: input.payors,
+        payorsCrossPlanTypes: input.payorsCrossPlanTypes,
+        context: input.geography || input.context,
+    });
+    if (!scope.success) {
+        return { status: 400, kind: 'error', answer: (0, askService_1.formatAskIssues)(scope.error) };
+    }
+    const data = loadDeps(deps);
+    const previous = input.sessionId ? sessions.get(input.sessionId) : null;
+    const interpreted = interpretRankMessage(message, previous);
+    if (interpreted.affirm && previous?.pending && interpreted.intent !== 'geography') {
+        if (previous.pending.names) interpreted.namedGroups = previous.pending.names;
+        else interpreted.change = previous.pending;
+        interpreted.intent = 'predict';
+    }
+    if (input.change?.name) {
+        interpreted.change = { action: input.change.action || 'add', phrase: input.change.name };
+        interpreted.intent = 'predict';
+    }
+    const state = input.geography?.state || input.context?.state || '';
+    if (state && !/^(tx|texas)$/i.test(state)) {
+        return { kind: 'clarify', answer: 'Only Texas geographies are in scope. Name a Texas county.' };
+    }
+    if (/\b(california|florida|new york|oklahoma|louisiana)\b/i.test(message)) {
+        return { kind: 'clarify', answer: 'Only Texas geographies are in scope. Name a Texas county.' };
+    }
+    const county = interpreted.county || input.geography?.county || input.context?.county || '';
+    if (!county) {
+        return { kind: 'clarify', answer: 'Name the Texas county, for example Houston County. Rank is always against competitor networks in that county.' };
+    }
+    if (!data.rankings.length) {
+        return {
+            kind: 'needs_data',
+            answer: 'Rankings are not loaded. Add data/rankings.csv for the current roster position and data/roster.csv for each health system or group reach.',
+            expectedFiles: rankingsStore_1.RANK_FILE_HELP,
+            assumptions: ['Competitor networks are held constant unless you name a competitor change.'],
+        };
+    }
+    const focalChoice = chooseFocal(`${message} ${previous?.payor || ''} ${previous?.planType || ''}`, scope.data, data.rankings);
+    if (focalChoice.clarify && !(previous?.payor && previous?.planType)) {
+        return { kind: 'clarify', answer: focalChoice.clarify };
+    }
+    const payor = focalChoice.payor || previous?.payor;
+    const planType = focalChoice.planType || previous?.planType;
+    const slice = sliceRows(data.rankings, county, planType);
+    if (!slice.length) {
+        return { kind: 'needs_data', answer: `No Texas rankings are loaded for ${county} County and ${planType}.`, expectedFiles: rankingsStore_1.RANK_FILE_HELP };
+    }
+    const metrics = [...new Set(slice.map((row) => row.metric))];
+    const metric = metrics.find((item) => message.toLowerCase().includes(item.toLowerCase())) || (metrics.length === 1 ? metrics[0] : null);
+    if (!metric) {
+        const saved = remember(previous, { county, payor, planType });
+        const lead = interpreted.intent === 'best'
+            ? `Best depends on the metric. I will not pick one for you. Loaded metrics: ${metrics.join(', ')}.`
+            : `Which metric should set the rank? Loaded metrics: ${metrics.join(', ')}.`;
+        return { kind: 'clarify', sessionId: saved.id, answer: lead, metrics };
+    }
+    const metricRows = slice.filter((row) => row.metric === metric);
+    const rankingsPayor = matchPayor(payor, metricRows);
+    if (!rankingsPayor) {
+        const known = [...new Set(metricRows.map((row) => row.payor))];
+        return { kind: 'clarify', answer: `${payor} is not in the ${county} County ${planType} rankings. Loaded payors: ${known.join(', ')}.` };
+    }
+    const { focal, competitors } = aggregate(metricRows, rankingsPayor);
+    if (!focal) return { kind: 'clarify', answer: `${payor} has no ${metric} value in ${county} County.` };
+    const asOf = latestAsOf(metricRows);
+    const competitorPayors = competitors.map((row) => row.payor);
+    const assumptions = baseAssumptions(metric, asOf, 'Overlap comes from the roster file when present, otherwise from a stated default.');
+    const session = remember(previous, { county, payor: rankingsPayor, planType, metric });
+    const pack = { focal, competitors, metric, asOf };
+    const catalog = catalogFor(data.roster, county, planType).map((row) => entityRecord(row, rankingsPayor, competitorPayors));
+
+    if (interpreted.intent === 'against') {
+        const found = matchPayor(interpreted.against, metricRows);
+        if (!found) {
+            return {
+                kind: 'unavailable',
+                sessionId: session.id,
+                answer: `No roster is loaded for ${interpreted.against} in ${county} County, so I can't rank against them.`,
+                competitorSet: [rankingsPayor, ...competitorPayors],
+            };
+        }
+    }
+
+    if (interpreted.intent === 'best') {
+        const body = baselineBody(session, pack, assumptions);
+        const best = body.baseline.rank === 1;
+        body.kind = 'baseline';
+        body.sessionId = session.id;
+        body.answer = `On ${metric}${asOf ? ` as of ${asOf}` : ''}, ${focal.payor} is rank ${body.baseline.rank} of ${body.baseline.of} in ${county} County. ${best ? `It is the best network on ${metric}.` : `It is not the best network on ${metric}.`}`;
+        return body;
+    }
+
+    if (interpreted.intent === 'sensitivity') {
+        const body = baselineBody(session, pack, assumptions);
+        body.sessionId = session.id;
+        if (interpreted.closeRank) {
+            const gap = (0, rankModel_1.reachToRank)(focal.value, competitors, interpreted.closeRank);
+            body.sensitivity.targetRank = interpreted.closeRank;
+            body.sensitivity.reachToRank = gap.gap;
+            body.answer = gap.already
+                ? `On ${metric}, ${focal.payor} is already rank ${gap.current} in ${county} County. The gap to rank ${interpreted.closeRank} is 0 beneficiary reach.`
+                : gap.gap == null
+                    ? `Rank ${interpreted.closeRank} is not defined for this competitor set on ${metric}.`
+                    : `On ${metric}, ${comma(gap.gap)} beneficiary reach separates ${focal.payor} from rank ${interpreted.closeRank}.`;
+        }
+        return body;
+    }
+
+    if (interpreted.intent === 'recap') {
+        if (!previous?.lastPrediction) {
+            return { kind: 'clarify', sessionId: session.id, answer: 'There is no confirmed change to measure yet.' };
+        }
+        return { kind: 'prediction', sessionId: session.id, ...previous.lastPrediction, answer: previous.lastPrediction.answer };
+    }
+
+    if (interpreted.intent === 'geography') {
+        const scenario = previous?.lastChange;
+        if (!scenario?.length) {
+            return { kind: 'clarify', sessionId: session.id, answer: 'Confirm the network change first. I will then keep that scenario and compare the adjacent counties.' };
+        }
+        const counties = [county, ...(0, countyNeighbors_1.adjacentCounties)(county)];
+        const breakdown = counties.map((name) => scoreCounty(data, name, planType, rankingsPayor, metric, scenario));
+        const slipped = breakdown.filter((row) => row.holds === false).map((row) => row.county);
+        const held = breakdown.filter((row) => row.holds === true).map((row) => row.county);
+        const home = breakdown[0];
+        const answer = [
+            home?.rankToday != null ? `In ${county} County the change moves rank ${home.rankToday} to rank ${home.rankAfter}. Beneficiary reach lost: ${comma(home.reachLost || 0)}.` : '',
+            held.length ? `The position holds in ${held.join(', ')}.` : '',
+            slipped.length ? `The position slips in ${slipped.join(', ')}.` : '',
+            breakdown.filter((row) => row.status && row.status !== 'ok').map((row) => `${row.county} County: ${row.status === 'missing_roster' ? 'roster is missing' : 'rankings are missing'}.`).join(' '),
+        ].filter(Boolean).join(' ');
+        return {
+            kind: 'geography',
+            sessionId: session.id,
+            answer,
+            scenario,
+            counties: breakdown,
+            metric,
+            assumptions,
+            method: METHOD,
+        };
+    }
+
+    if (interpreted.intent === 'baseline' || interpreted.intent === 'sensitivity') {
+        const body = baselineBody(session, pack, assumptions);
+        body.sessionId = session.id;
+        return body;
+    }
+
+    if (interpreted.intent === 'prescribe' || interpreted.intent === 'safe_removals') {
+        const additions = (0, rankModel_1.planAdditions)({
+            focalValue: focal.value,
+            competitors,
+            candidates: catalog.filter((row) => !row.onFocal),
+            targetRank: interpreted.targetRank || 1,
+        });
+        const removals = (0, rankModel_1.safeRemovals)({ focalValue: focal.value, competitors, candidates: catalog.filter((row) => row.onFocal) });
+        const baseline = baselineBody(session, pack, assumptions);
+        const answer = interpreted.intent === 'safe_removals'
+            ? `${baseline.answer} Rank-safe removals, largest first: ${removals.length ? removals.map((row) => `${row.name} (${comma(row.reachAtRisk)} ${metric} at risk)`).join('; ') : 'none'}.`
+            : `${baseline.answer} Smallest set of additions toward rank ${interpreted.targetRank || 1}: ${additions.picks.length ? additions.picks.map((row) => `${row.name} gains ${comma(row.marginalReach)} ${metric} and lands at rank ${row.predictedRank}`).join('; ') : 'none with a positive marginal reach'}.`;
+        return {
+            kind: 'prescription',
+            sessionId: session.id,
+            answer,
+            geography: baseline.geography,
+            focal: baseline.focal,
+            metric,
+            asOf,
+            competitorSet: baseline.competitorSet,
+            baseline: baseline.baseline,
+            sensitivity: baseline.sensitivity,
+            targetRank: interpreted.targetRank || (interpreted.intent === 'prescribe' ? 1 : null),
+            additions: additions.picks,
+            additionsReachTarget: additions.reached,
+            rankSafeRemovals: removals,
+            assumptions,
+            method: METHOD,
+        };
+    }
+
+    const namedGroups = interpreted.namedGroups;
+    const confirmed = Boolean(input.confirmed) || interpreted.affirm;
+    if (interpreted.smallGroups || namedGroups) {
+        const picked = namedGroups
+            ? namedGroups.map((name) => catalog.find((row) => (0, entityResolve_1.normalizeName)(row.name) === (0, entityResolve_1.normalizeName)(name))).filter(Boolean)
+            : catalog.filter((row) => row.onFocal && row.entityType === 'group').sort((a, b) => a.reach - b.reach).slice(0, interpreted.smallGroups);
+        if (!namedGroups && picked.length < interpreted.smallGroups) {
+            return { kind: 'clarify', sessionId: session.id, answer: `The ${rankingsPayor} roster in ${county} County has ${picked.length} groups, not ${interpreted.smallGroups}.` };
+        }
+        if (!confirmed) {
+            remember(session, { pending: { action: 'remove', names: picked.map((row) => row.name) } });
+            return {
+                kind: 'confirm',
+                sessionId: session.id,
+                answer: `Confirm the termination of ${picked.map((row) => row.name).join(', ')} before I predict rank.`,
+                candidates: picked.map((row) => ({ name: row.name, entityType: row.entityType, reach: row.reach })),
+                geography: { county, state: 'TX' },
+                focal: { payor: rankingsPayor, planType },
+                assumptions: ['The groups are confirmed before any post-change rank is computed.', ...assumptions],
+            };
+        }
+        const changes = picked.map((row) => ({ action: 'remove', name: row.name, entityType: row.entityType, reach: row.reach, overlap: row.overlap }));
+        const result = (0, rankModel_1.predictChange)({ focal, competitors, changes });
+        return finishPrediction(session, result, metric, asOf, assumptions, driversFor(result, metric).join(' '));
+    }
+
+    const pending = interpreted.change;
+    if (!pending?.phrase && !input.change?.name) {
+        const body = baselineBody(session, pack, assumptions);
+        body.sessionId = session.id;
+        return body;
+    }
+    const phrase = input.change?.name || pending.phrase;
+    const action = input.change?.action || pending.action;
+    const matches = (0, entityResolve_1.resolveEntities)(phrase, catalog);
+    const recommended = matches[0] && (matches.length === 1 || matches[0].score - (matches[1]?.score || 0) >= 0.15) ? matches[0] : null;
+    if (!confirmed || !recommended) {
+        remember(session, { pending: { action, phrase: recommended?.name || phrase } });
+        return {
+            kind: 'confirm',
+            sessionId: session.id,
+            answer: matches.length
+                ? `Confirm the ${action === 'remove' ? 'termination' : 'addition'} before I predict rank. I matched "${phrase}" to ${matches.map((row) => row.name).join(', ')}.`
+                : `I could not match "${phrase}" to a health system or group in the ${county} County roster. No rank was computed.`,
+            candidates: matches.map((row) => ({ name: row.name, entityType: row.entityType, score: row.score, reach: row.reach, onFocal: row.onFocal })),
+            recommended: recommended ? { name: recommended.name, entityType: recommended.entityType, action } : null,
+            geography: { county, state: 'TX' },
+            focal: { payor: rankingsPayor, planType },
+            assumptions: ['The entity is confirmed before any post-change rank is computed.', ...assumptions],
+        };
+    }
+    if (recommended.reach == null) {
+        return { kind: 'confirm', sessionId: session.id, answer: `${recommended.name} is recognized, but the roster has no beneficiary reach for it, so there is no prediction.`, candidates: [recommended] };
+    }
+    const change = { action, name: recommended.name, entityType: recommended.entityType, reach: recommended.reach, overlap: recommended.overlap, overlapSource: recommended.overlapSource };
+    const result = (0, rankModel_1.predictChange)({ focal, competitors, changes: [change] });
+    return finishPrediction(session, result, metric, asOf, assumptions, driversFor(result, metric).join(' '));
+}

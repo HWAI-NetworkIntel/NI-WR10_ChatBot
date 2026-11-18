@@ -22,7 +22,7 @@ app.use((req, res, next) => {
   next()
 })
 app.use(express.json({ limit: '100kb' }))
-app.use(['/ask', '/llm'], rateLimit({
+app.use(['/ask', '/llm', '/rank'], rateLimit({
   windowMs: 60_000,
   limit: 30,
   standardHeaders: true,

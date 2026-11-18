@@ -110,6 +110,18 @@ function loadExamples() {
     const file = JSON.parse((0, node_fs_1.readFileSync)((0, node_path_1.join)(docs, 'examples.json'), 'utf8'));
     return { examples: file.examples, allowedTables: catalog.tables.map((table) => table.table) };
 }
+const EVAL_SCOPE = {
+    payors: ['Humana', 'UnitedHealthcare'],
+    payorsCrossPlanTypes: [
+        { payor: 'Humana', planType: 'HMO' },
+        { payor: 'Humana', planType: 'PPO' },
+        { payor: 'UnitedHealthcare', planType: 'HMO' },
+        { payor: 'UnitedHealthcare', planType: 'PPO' },
+    ],
+};
+function askBody(question) {
+    return JSON.stringify({ question, ...EVAL_SCOPE });
+}
 async function ask(question) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ASK_TIMEOUT_MS);
@@ -117,7 +129,7 @@ async function ask(question) {
         let response = await fetch(`${BASE_URL}/ask`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ question }),
+            body: askBody(question),
             signal: controller.signal,
         });
         if (response.status === 429) {
@@ -125,7 +137,7 @@ async function ask(question) {
             response = await fetch(`${BASE_URL}/ask`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ question }),
+                body: askBody(question),
                 signal: controller.signal,
             });
         }

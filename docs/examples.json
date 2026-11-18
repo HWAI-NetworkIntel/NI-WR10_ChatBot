@@ -19,7 +19,7 @@
   },
   {
    "question": "Which networks include Baylor University Medical Center?",
-   "sql": "SELECT TOP 50 n.NetworkId, n.NetworkName, n.Carrier_Name, n.NetworkCategory\nFROM HospitalDetails hd\nJOIN NetworkHospitalMapping nhm ON nhm.HospitalId = hd.HospitalId\nJOIN Network n ON n.NetworkId = nhm.NetworkId\nWHERE hd.HosptitalName LIKE '%Baylor University Medical%'\nORDER BY n.Carrier_Name, n.NetworkName"
+   "sql": "SELECT TOP 50 n.NetworkId, n.NetworkName, n.Carrier_Name, n.NetworkCategory\nFROM HospitalDetails hd\nJOIN NetworkHospitalMapping nhm ON nhm.HospitalId = hd.HospitalId\nJOIN Network n ON n.NetworkId = nhm.NetworkId\nWHERE hd.HosptitalName LIKE '%Baylor University Medical%'\n  AND hd.FIPS LIKE '48%'\nORDER BY n.Carrier_Name, n.NetworkName"
   },
   {
    "question": "If Baylor Scott & White leaves Humana, how many Humana in-network providers in Texas are affiliated with Baylor hospitals?",
@@ -35,7 +35,7 @@
   },
   {
    "question": "How many in-network oncologists does each payer have within 30 miles of Bell County?",
-   "sql": "WITH target AS (SELECT c.FIPS FROM County c WHERE c.StateCode = 'TX' AND c.CountyName LIKE 'Bell%')\nSELECT TOP 15 po.ParentOrganizationName, COUNT(DISTINCT m.NPI) AS OncologistsWithin30mi\nFROM MilesIndividual_30 m\nJOIN target t ON t.FIPS = m.Isochrone_FIPS\nJOIN Speciality sp ON sp.SpecialityCode = m.SpecialityCode\nJOIN ProviderLocation pl ON pl.NPI = m.NPI AND pl.FIPS = m.NPI_FIPS\nJOIN NetworkProviderMapping npm ON npm.ProviderLocationId = pl.ProviderLocationId\nJOIN ParentOrganization po ON po.ParentOrganizationId = npm.ParentOrganizationId\nWHERE sp.HWAISpecialtyDescription LIKE '%oncolog%'\nGROUP BY po.ParentOrganizationName\nORDER BY OncologistsWithin30mi DESC"
+   "sql": "WITH target AS (SELECT c.FIPS FROM County c WHERE c.StateCode = 'TX' AND c.CountyName LIKE 'Bell%')\nSELECT TOP 15 po.ParentOrganizationName, COUNT(DISTINCT m.NPI) AS OncologistsWithin30mi\nFROM MilesIndividual_30 m\nJOIN target t ON t.FIPS = m.Isochrone_FIPS\nJOIN Speciality sp ON sp.SpecialityCode = m.SpecialityCode\nJOIN ProviderLocation pl ON pl.NPI = m.NPI AND pl.FIPS = m.NPI_FIPS\nJOIN NetworkProviderMapping npm ON npm.ProviderLocationId = pl.ProviderLocationId\nJOIN ParentOrganization po ON po.ParentOrganizationId = npm.ParentOrganizationId\nWHERE sp.HWAISpecialtyDescription LIKE '%oncolog%'\n  AND m.NPI_FIPS LIKE '48%' AND m.Isochrone_FIPS LIKE '48%'\nGROUP BY po.ParentOrganizationName\nORDER BY OncologistsWithin30mi DESC"
   },
   {
    "question": "List the plans that use Humana networks in Texas with their star ratings",
