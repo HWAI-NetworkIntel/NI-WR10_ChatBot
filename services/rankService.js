@@ -95,7 +95,7 @@ function resetRankSessions() {
 }
 
 function looksLikeRankQuestion(text) {
-    return /\brank\b|terminat|health system|physician group|where do we (?:land|rank)|if we (?:add|remove|drop|terminate)|adjacent count|surrounding count|best network|against payer|small groups/i.test(String(text || ''));
+    return /\brank(?:ed|ing)?\b|\btop\s+\d+\b|terminat|health system|physician group|where do we (?:land|rank)|if we (?:add|remove|drop|terminate)|adjacent count|surrounding count|best network|against payer|small groups/i.test(String(text || ''));
 }
 
 function refusesWrite(text) {
@@ -330,6 +330,72 @@ function extractAgainst(message) {
     return match ? match[1].trim() : '';
 }
 
+function countyOnlyMessage(text) {
+    return /^(?:in\s+)?[a-z][a-z .'-]{1,40}(?:\s+county)?(?:\s*,?\s*(?:texas|tx))?$/i.test(String(text || '').trim());
+}
+
+/** A request for the ordered payor list, not one payor's position. */
+function listRequest(message) {
+    const text = String(message || '').trim();
+    const listed = /\b(top\s+\d+|highest\s+rank|best\s+rank|ranked\s+pay(?:er|or)s?|all\s+ranked)\b/i.test(text);
+    const countyOnly = countyOnlyMessage(text);
+    if (!listed && !countyOnly) return null;
+    const top = text.match(/\btop\s+(\d+)\b/i);
+    return {
+        limit: top ? Math.min(Math.max(Number(top[1]), 1), 50) : null,
+        highest: /\b(highest|best)\s+rank\b/i.test(text) && !top,
+        countyOnly: countyOnly && !listed,
+    };
+}
+
+function orderedPayors(rows) {
+    const byPayor = new Map();
+    for (const row of rows) {
+        const current = byPayor.get(row.payor) ?? { payor: row.payor, value: 0, publishedRank: null };
+        current.value += row.value;
+        if (row.publishedRank != null) {
+            current.publishedRank = current.publishedRank == null
+                ? row.publishedRank
+                : Math.min(current.publishedRank, row.publishedRank);
+        }
+        byPayor.set(row.payor, current);
+    }
+    const list = [...byPayor.values()];
+    const published = list.length > 0 && list.every((row) => row.publishedRank != null);
+    if (published) list.sort((a, b) => a.publishedRank - b.publishedRank || a.payor.localeCompare(b.payor));
+    else list.sort((a, b) => b.value - a.value || a.payor.localeCompare(b.payor));
+    return list.map((row, index) => ({
+        payor: row.payor,
+        value: row.value,
+        rank: published ? row.publishedRank : index + 1,
+        focal: false,
+    }));
+}
+
+function listSections(message, rows) {
+    const types = uniqueSorted(rows.map((row) => row.planType));
+    const named = types.filter((type) => new RegExp(`\\b${type}\\b`, 'i').test(message));
+    return (named.length ? named : types).map((planType) => {
+        const standings = orderedPayors(rows.filter((row) => row.planType.toLowerCase() === planType.toLowerCase()));
+        return { planType, standings };
+    }).filter((section) => section.standings.length);
+}
+
+function formatList(county, section, request) {
+    const standings = request.limit ? section.standings.slice(0, request.limit) : section.standings;
+    const lines = standings.map((row) => `${row.rank}. ${row.payor}`).join('; ');
+    const place = `${section.planType} payors in ${county} County, Texas`;
+    if (request.highest && standings[0]) {
+        const top = section.standings[0];
+        const of = Math.max(...section.standings.map((row) => row.rank));
+        return `The highest ranked ${section.planType} payor in ${county} County, Texas is ${top.payor}, rank ${top.rank} of ${of}. Ranked ${section.planType} payors: ${section.standings.map((row) => `${row.rank}. ${row.payor}`).join('; ')}.`;
+    }
+    const label = request.limit
+        ? `Top ${standings.length} of ${section.standings.length} ${place}`
+        : `Ranked ${place} (${section.standings.length})`;
+    return `${label}: ${lines}.`;
+}
+
 function interpretRankMessage(message, session) {
     const text = String(message || '').trim();
     const county = extractCounty(text) || session?.county || '';
@@ -343,18 +409,20 @@ function interpretRankMessage(message, session) {
     const spread = /\badjacent counties\b|\bsurrounding counties\b|\bhold across\b|\bacross the surrounding\b/i.test(text);
     const recap = /\bhow much rank did we lose\b|\brank did we lose\b/i.test(text);
     const best = /\bbest network\b/i.test(text);
+    const list = listRequest(text);
     const affirm = /^(yes|yep|yeah|confirm|go ahead|use that|that one)\b/i.test(text) || /\brank after that\b|\bafter that\b/i.test(text);
     let intent = 'baseline';
     if (spread) intent = 'geography';
     else if (recap && !change) intent = 'recap';
     else if (smallGroups) intent = 'predict';
     else if (safeRemoval) intent = 'safe_removals';
+    else if (list) intent = 'list';
     else if (best) intent = 'best';
     else if (against) intent = 'against';
     else if (sensitivity) intent = 'sensitivity';
     else if (targetRank && !change) intent = 'prescribe';
     else if (change) intent = 'predict';
-    return { text, county, change, smallGroups, targetRank, closeRank, against, intent, affirm };
+    return { text, county, change, smallGroups, targetRank, closeRank, against, intent, affirm, list };
 }
 
 function sliceRows(rankings, county, planType) {
@@ -664,6 +732,30 @@ async function answerRank(input, deps) {
             answer: 'Rankings are not loaded. Add data/rankings.csv for the current roster position and data/roster.csv for each health system or group reach.',
             expectedFiles: rankingsStore_1.RANK_FILE_HELP,
             assumptions: ['Competitor networks are held constant unless you name a competitor change.'],
+        };
+    }
+    const listing = listRequest(message);
+    if (listing && (!listing.countyOnly || fromLatest)) {
+        const countyRows = data.rankings.filter((row) => samePlace(row, county));
+        const sections = listSections(message, countyRows);
+        if (!sections.length) {
+            return { kind: 'needs_data', answer: `No Texas rankings are loaded for ${county} County.`, expectedFiles: rankingsStore_1.RANK_FILE_HELP };
+        }
+        const answer = sections.map((section) => formatList(county, section, listing)).join(' ');
+        const standings = sections.flatMap((section) => {
+            const rows = listing.highest || !listing.limit ? section.standings : section.standings.slice(0, listing.limit);
+            return sections.length > 1
+                ? rows.map((row) => ({ ...row, payor: `${row.payor} (${section.planType})` }))
+                : rows;
+        });
+        const saved = remember(previous, { county, planType: sections.length === 1 ? sections[0].planType : previous?.planType });
+        return {
+            kind: 'baseline',
+            sessionId: saved.id,
+            answer,
+            geography: { county, state: 'TX' },
+            standings,
+            competitorSet: standings.map((row) => row.payor),
         };
     }
     const focalChoice = chooseFocal(`${message} ${earlier} ${previous?.question || ''} ${previous?.payor || ''} ${previous?.planType || ''}`, scope.data, data.rankings);
