@@ -45,6 +45,10 @@ const RATING_COLUMNS = [
     'Hosp_MA Utilization Score category',
     'Hosp_Quality Score rating',
     'Modified Hwai Rating',
+    // Share of providers rated High on quality: this, not the count, is what the network score uses.
+    'PCP_Quality Score %',
+    'Spe_Quality Score %',
+    'Hosp_Quality Score %',
 ];
 
 const table = parseCsv(fs.readFileSync(source, 'utf8'));

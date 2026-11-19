@@ -19,15 +19,16 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { parseCsv } = require('./rankingsStore')
+const { TERMS } = require('./terminology')
 
 const METRICS = [
-  { column: 'pcp_npi_count_without_low_exclude_hosp', label: 'PCPs in network', drives: true },
-  { column: 'spe_npi_count_without_low_exclude_hosp', label: 'Physician groups in network', drives: true },
-  { column: 'other_npi_count_without_low_exclude_hosp', label: 'Other providers in network', drives: false },
-  { column: 'PCP_Quality Score rating', label: 'PCPs rated High on quality', drives: true },
-  { column: 'Spe_Quality Score rating', label: 'Physician groups rated High on quality', drives: true },
-  { column: 'Hosp_Quality Score rating', label: 'Health systems rated High on quality', drives: true },
-  { column: 'Modified Hwai Rating', label: 'Modified HWAI rating', drives: true },
+  { column: 'pcp_npi_count_without_low_exclude_hosp', label: TERMS.pcpBreadth, drives: true },
+  { column: 'spe_npi_count_without_low_exclude_hosp', label: TERMS.physicianGroupBreadth, drives: true },
+  { column: 'other_npi_count_without_low_exclude_hosp', label: TERMS.otherBreadth, drives: false },
+  { column: 'PCP_Quality Score rating', scoreColumn: 'PCP_Quality Score %', label: TERMS.pcpQuality, drives: true },
+  { column: 'Spe_Quality Score rating', scoreColumn: 'Spe_Quality Score %', label: TERMS.physicianGroupQuality, drives: true },
+  { column: 'Hosp_Quality Score rating', scoreColumn: 'Hosp_Quality Score %', label: TERMS.hospitalQuality, drives: true },
+  { column: 'Modified Hwai Rating', label: TERMS.starRating, drives: true },
   { column: 'PCP_Cost Score rating', label: 'PCPs rated High on cost', drives: false },
   { column: 'PCP_FFS Utilization Score category', label: 'PCPs rated High on FFS utilization', drives: false },
   { column: 'PCP_MA Utilization Score category', label: 'PCPs rated High on MA utilization', drives: false },
@@ -43,7 +44,8 @@ const METHOD = [
   "Ranks are county-wide: every payor × plan type network in the county (HMO and PPO) is ranked in one list, weighted by enrollment across the payor's plans.",
   "Provider counts and ratings come from the payor's largest plan in the county (highest July 2026 enrollment).",
   'Rated-High counts are the number of distinct providers in the network rated High on that measure.',
-  'Only measures that drive the rank are listed: PCPs, physician groups, providers rated High on quality, and the Modified HWAI rating.',
+  'Only measures that drive the rank are listed: PCPs, physician groups, quality scores, and the star rating (Modified HWAI rating, out of 5).',
+  'A quality score is the share of providers in the network rated High on quality. The rank uses this share, so quality rows are compared on it; the count rated High is shown beside it.',
   'Competitor networks are held as published. Closing a gap does not guarantee a rank change, because the rank is relative within the county.',
 ]
 
@@ -104,7 +106,8 @@ function loadRatings(file = path.join(__dirname, '..', 'data', 'network_ratings.
     network: cells[at.network],
     networkScore: numberOrNull(cells[at.rankScore] ?? cells[at.networkScore]),
     rank: numberOrNull(cells[at.rank]),
-    metrics: Object.fromEntries(METRICS.map((metric) => [metric.column, numberOrNull(cells[at[metric.column]])])),
+    metrics: Object.fromEntries(METRICS.flatMap((metric) => [metric.column, metric.scoreColumn].filter(Boolean))
+      .map((column) => [column, numberOrNull(cells[at[column]])])),
   })).filter((row) => row.county && row.payor && row.rank != null)
   cached = { file, rows }
   return rows
@@ -122,10 +125,23 @@ function unique(values) {
 function drivingGaps(focal, other) {
   return METRICS.filter((metric) => metric.drives)
     .map((metric) => {
-      const mine = focal.metrics[metric.column]
-      const theirs = other.metrics[metric.column]
+      // Quality is judged on the score (% rated High) when both sides have it, else on the count.
+      const column = metric.scoreColumn && focal.metrics[metric.scoreColumn] != null && other.metrics[metric.scoreColumn] != null
+        ? metric.scoreColumn
+        : metric.column
+      const mine = focal.metrics[column]
+      const theirs = other.metrics[column]
       if (mine == null || theirs == null || theirs <= mine) return null
-      return { metric, mine, theirs, gap: theirs - mine, relative: (theirs - mine) / Math.max(Math.abs(theirs), 1) }
+      return {
+        metric,
+        byScore: column === metric.scoreColumn,
+        mine,
+        theirs,
+        mineCount: focal.metrics[metric.column],
+        theirsCount: other.metrics[metric.column],
+        gap: theirs - mine,
+        relative: (theirs - mine) / Math.max(Math.abs(theirs), 1),
+      }
     })
     .filter(Boolean)
     .sort((a, b) => b.relative - a.relative)
@@ -183,36 +199,66 @@ function countyComparison(rows, focal, request) {
   const closest = compare[0]
   const leader = compare[1]
   const lines = [`${label(focal)} is rank ${focal.rank} of ${payorsRanked} in ${county} County.`]
+  const tables = []
   if (focal.rank < closest.rank) {
     const gaps = drivingGaps(focal, closest)
-    lines.push(gaps.length
-      ? `\nTo keep the lead over ${label(closest)} (rank ${closest.rank}), close the areas where it is ahead:\n${bulletList(gaps)}`
-      : `\nIt is ahead of ${label(closest)} (rank ${closest.rank}) on every improvable measure.`)
-    return { answer: lines.join('\n') }
+    if (gaps.length) tables.push(gapTable(`To keep the lead over ${label(closest)} (rank ${closest.rank}), close the areas where it is ahead`, focal, closest, gaps))
+    else lines.push(`It is ahead of ${label(closest)} (rank ${closest.rank}) on every improvable measure.`)
+    return { answer: lines.join('\n'), tables }
   }
   const gaps = drivingGaps(focal, closest)
-  lines.push(gaps.length
-    ? `\nWhat can be improved to pass ${label(closest)} (rank ${closest.rank}):\n${bulletList(gaps)}`
-    : `\n${label(closest)} (rank ${closest.rank}) is not ahead on PCPs, physician groups, health systems, quality ratings, or the Modified HWAI rating. The difference comes from measures outside this comparison.`)
+  if (gaps.length) tables.push(gapTable(`What can be improved to pass ${label(closest)} (rank ${closest.rank})`, focal, closest, gaps))
+  else lines.push(`${label(closest)} (rank ${closest.rank}) is not ahead on PCPs, physician groups, quality scores, or the star rating. The difference comes from measures outside this comparison.`)
   if (leader) {
     const toLeader = drivingGaps(focal, leader).slice(0, 4)
-    if (toLeader.length) lines.push(`\nTo reach the leader, ${label(leader)} (rank ${leader.rank}):\n${bulletList(toLeader)}`)
+    if (toLeader.length) tables.push(gapTable(`To reach the leader, ${label(leader)} (rank ${leader.rank})`, focal, leader, toLeader))
   }
-  return { answer: lines.join('\n') }
+  return { answer: lines.join('\n'), tables }
 }
 
 function formatNumber(value) {
   return Number.isInteger(value) ? value.toLocaleString('en-US') : String(round(value))
 }
 
-/** "• PCPs in network: 1,369 vs 1,411 (add 42)" */
-function bulletList(gaps) {
-  return gaps.map((item) => {
-    const need = item.metric.column === 'Modified Hwai Rating'
-      ? `raise by ${round(item.gap)}`
-      : `add ${formatNumber(Math.ceil(item.gap))}`
-    return `• ${item.metric.label}: ${formatNumber(item.mine)} vs ${formatNumber(item.theirs)} (${need})`
-  }).join('\n')
+const HWAI = 'Modified Hwai Rating'
+
+/** 3.45 -> "★★★½☆ 3.45": nearest half star out of 5, with the exact rating. */
+function starRating(value) {
+  if (value == null) return ''
+  const halves = Math.round(Math.min(Math.max(value, 0), 5) * 2)
+  const full = Math.floor(halves / 2)
+  const half = halves % 2
+  return `${'★'.repeat(full)}${half ? '½' : ''}${'☆'.repeat(5 - full - half)} ${round(value)}`
+}
+
+function displayValue(metric, value) {
+  return metric.column === HWAI ? starRating(value) : formatNumber(value)
+}
+
+/** "63.6% (7 rated High)" for quality rows judged on the score. */
+function qualityValue(score, count) {
+  const share = `${(Math.round(score * 10) / 10).toFixed(1)}%`
+  return count == null ? share : `${share} (${formatNumber(count)} rated High)`
+}
+
+function cellValue(item, side) {
+  if (item.byScore) return qualityValue(item[side], item[`${side}Count`])
+  return displayValue(item.metric, item[side])
+}
+
+function neededText(item) {
+  if (item.metric.column === HWAI) return `raise by ${round(item.gap)} stars`
+  if (item.byScore) return `raise by ${(Math.round(item.gap * 10) / 10).toFixed(1)} pts`
+  return `add ${formatNumber(Math.ceil(item.gap))}`
+}
+
+/** One table per comparison: our value and the competitor's value side by side. */
+function gapTable(title, focal, other, gaps) {
+  return {
+    title,
+    columns: ['Measure', label(focal), label(other), 'Needed'],
+    rows: gaps.map((item) => [item.metric.label, cellValue(item, 'mine'), cellValue(item, 'theirs'), neededText(item)]),
+  }
 }
 
 function statewideSummary(rows, payor, planType) {

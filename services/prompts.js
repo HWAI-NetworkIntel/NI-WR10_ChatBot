@@ -44,6 +44,7 @@ function networkChatSystemPrompt(callerSystem) {
         'If the metric, payor, or plan type is missing, ask only for those. Stay on provider networks.',
         'Do not invent provider, hospital, or enrollment counts. Counts come from the Texas network data.',
         'When the caller instructions require a specific output format, such as JSON, follow that format. These rules decide the subject.',
+        ...require('./terminology').GLOSSARY,
     ].join('\n');
     const extra = typeof callerSystem === 'string' ? callerSystem.trim() : '';
     return extra ? `${domain}\n\nCaller instructions:\n${extra}` : domain;
@@ -60,6 +61,7 @@ function answerSystemPrompt() {
         '- If ROW_LIMIT_HIT is true, say the list was cut off at the row limit.',
         '- Mention the assumptions briefly if they affect the answer.',
         '- Do not mention SQL, tables or column names; the UI shows those separately as references.',
+        ...require('./terminology').GLOSSARY,
     ].join('\n');
 }
 function answerUserMessage(question, draft, columns, rows, rowLimitHit) {
