@@ -1,11 +1,13 @@
 const { understandQuestion } = require('./questionIntent')
+const { answerHcaRemoval } = require('./scenarioRanks')
 const { scenarioIssue } = require('./stage2Params')
 const { formatStage2Answer, lookupsReady, runStage2 } = require('./stage2Runner')
 
 /**
  * The model classifies the question, then:
  * a current rank or a payor comparison is read from the Python script,
- * a removal is recomputed by that script,
+ * removing HCA Healthcare for UnitedHealthcare is answered from the scored scenario file,
+ * any other removal is recomputed by that script,
  * an addition or a "how close" question stays on the roster rank model.
  * Returns null, or { change } / { message }, when the roster model should answer.
  */
@@ -13,6 +15,8 @@ async function answerFromStage2(input, deps = {}) {
   const message = String(input?.message || input?.question || '').trim()
   if (!message) return null
   const understood = await (deps.understandQuestion || understandQuestion)(input, deps)
+  const published = answerHcaRemoval(message, understood?.scenario, input)
+  if (published) return published
   if (!understood || understood.action === 'other' || understood.action === 'sensitivity') return null
 
   if (understood.action === 'add') return namedChange('add', understood)

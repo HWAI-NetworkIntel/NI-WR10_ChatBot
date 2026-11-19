@@ -8,6 +8,7 @@
 
 const path = require('node:path')
 const { loadRankData } = require('./rankingsStore')
+const { canonicalCounty } = require('./countyResolve')
 
 const MAX_ROWS = 500
 const MAX_PIVOT_COLUMNS = 40
@@ -32,7 +33,8 @@ const FIELDS = {
 }
 
 const NUMERIC = new Set(['value', 'rank', 'payorsRanked'])
-const DEFAULT_COLUMNS = ['county', 'payor', 'planType', 'rank', 'payorsRanked', 'value']
+// The network score is not shown unless the user asks for it by name: tables show ranks.
+const DEFAULT_COLUMNS = ['county', 'payor', 'planType', 'rank', 'payorsRanked']
 const PIVOT_VALUES = ['rank', 'value', 'payorsRanked', 'network']
 
 const ALIASES = {
@@ -281,6 +283,60 @@ function markdownTable(columns, rows, max = MARKDOWN_ROWS) {
   return lines.join('\n')
 }
 
+/**
+ * One sentence that says what the table means, so the answer leads with the insight.
+ *   one county:              who leads it, and where our network sits
+ *   one payor, many counties: how often it is rank 1, and its weakest county
+ * Nothing for wide tables (many payors × many counties): there is no single takeaway.
+ */
+function tableHeadline(matched, enriched, spec, context) {
+  if (!matched.length) return ''
+  const pairs = Array.isArray(context?.payorsCrossPlanTypes) ? context.payorsCrossPlanTypes : []
+  const ours = (row) => (spec.filters.payor.length
+    ? spec.filters.payor.some((name) => samePayor(name, row.payor))
+    : pairs.some((pair) => samePayor(pair.payor, row.payor) && samePlanType(pair.planType, row.planType)))
+  const counties = [...new Set(matched.map((row) => row.county))]
+  const named = (row) => `${row.payor} (${row.planType})`
+  if (counties.length === 1) {
+    const all = enriched.filter((row) => row.county === counties[0] && row.metric === matched[0].metric)
+    const leader = [...all].sort((a, b) => a.rank - b.rank)[0]
+    const mine = matched.filter(ours).sort((a, b) => a.rank - b.rank)[0]
+    if (!leader) return ''
+    if (mine && mine === leader) return `${named(mine)} leads ${counties[0]} County, rank 1 of ${leader.payorsRanked}.`
+    const lead = `${named(leader)} leads ${counties[0]} County.`
+    return mine ? `${lead} ${named(mine)} is rank ${mine.rank} of ${mine.payorsRanked}.` : lead
+  }
+  const payors = [...new Set(matched.map((row) => row.payor))]
+  if (payors.length !== 1) return ''
+  const firsts = new Set(matched.filter((row) => row.rank === 1).map((row) => row.county)).size
+  const byStanding = [...matched].sort((a, b) => (a.rank / a.payorsRanked) - (b.rank / b.payorsRanked) || a.rank - b.rank)
+  const best = byStanding[0]
+  const weakest = byStanding.at(-1)
+  const lead = firsts
+    ? `${payors[0]} is rank 1 in ${firsts} of ${counties.length} counties shown.`
+    : `${payors[0]} is not rank 1 in any of the ${counties.length} counties shown. Best: ${best.county} County, rank ${best.rank} of ${best.payorsRanked}.`
+  return `${lead} Weakest: ${weakest.county} County, rank ${weakest.rank} of ${weakest.payorsRanked}.`
+}
+
+/** Defaults that filled gaps in the question, in words the user can correct. */
+function tableAssumed(spec, context, asOf) {
+  const pairs = Array.isArray(context?.payorsCrossPlanTypes) ? context.payorsCrossPlanTypes : []
+  const assumed = []
+  if (spec.scope === 'dashboard' && !spec.filters.payor.length) {
+    if (pairs.length) {
+      const names = [...new Set(pairs.map((pair) => pair.payor))]
+      assumed.push(`your dashboard payor${names.length === 1 ? '' : 's'} (${names.join(', ')})`)
+    } else assumed.push('all payors (no dashboard payor is set)')
+  }
+  if (!spec.filters.planType.length) {
+    const types = [...new Set(pairs.map((pair) => pair.planType))]
+    assumed.push(spec.scope === 'dashboard' && types.length && !spec.filters.payor.length ? `dashboard plan types (${types.join(', ')})` : 'HMO and PPO')
+  }
+  if (!spec.filters.county.length) assumed.push('every Texas county')
+  if (asOf.length) assumed.push(`latest published rankings (${asOf.join(', ')})`)
+  return assumed
+}
+
 function defaultData() {
   return loadRankData(path.join(__dirname, '..', 'data'))
 }
@@ -297,6 +353,9 @@ function buildRankTable(rawSpec, context = {}, deps = {}) {
     return { kind: 'needs_data', answer: 'Rankings are not loaded. Add data/rankings.csv.', columns: [], rows: [], references }
   }
   const enriched = enrich(data.rankings)
+  // "hariss", "Ft Bend", "San Antonio" -> the county the user meant.
+  const knownCounties = [...new Set(enriched.map((row) => row.county))]
+  spec.filters.county = spec.filters.county.map((name) => canonicalCounty(name, knownCounties) || name)
   const matched = scopeRows(enriched, spec, context)
   const scope = describeScope(spec, context)
   const metrics = [...new Set(matched.map((row) => row.metric))]
@@ -324,7 +383,14 @@ function buildRankTable(rawSpec, context = {}, deps = {}) {
   ]
   if (spec.scope === 'dashboard' && !spec.filters.payor.length) assumptions.push('Limited to the dashboard payors. Ask for "all payors" to include competitors.')
   const shown = table.rows.length
-  const answer = `Published rankings for ${scope}: ${shown} row${shown === 1 ? '' : 's'}${table.rowLimitHit ? ` (cut off at ${shown} of ${table.total})` : ''}.`
+  const headline = tableHeadline(matched, enriched, spec, context)
+  const assumed = tableAssumed(spec, context, asOf)
+  const summary = `Published rankings for ${scope}: ${shown} row${shown === 1 ? '' : 's'}${table.rowLimitHit ? ` (cut off at ${shown} of ${table.total})` : ''}.`
+  const answer = [
+    headline,
+    summary,
+    assumed.length ? `Assumed: ${assumed.join(' · ')}. Name a payor, plan type, or county to narrow it.` : '',
+  ].filter(Boolean).join('\n')
   return {
     kind: 'data',
     answer,
@@ -337,6 +403,7 @@ function buildRankTable(rawSpec, context = {}, deps = {}) {
     sql: '',
     references,
     spec,
+    assumed,
   }
 }
 

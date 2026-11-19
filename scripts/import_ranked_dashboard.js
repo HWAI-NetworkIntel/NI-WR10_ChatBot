@@ -54,6 +54,17 @@ const RATING_COLUMNS = [
 const table = parseCsv(fs.readFileSync(source, 'utf8'));
 const [headers, ...body] = table;
 const index = Object.fromEntries(headers.map((header, position) => [header, position]));
+
+// Every parent organization in the extract, ranked or not, so a question about any of them is recognised.
+const payorCounts = new Map();
+for (const row of body) {
+    const payor = String(row[index.Parent_Organization] || '').trim();
+    if (!payor) continue;
+    const entry = payorCounts.get(payor) || { rows: 0, rankedRows: 0 };
+    entry.rows += 1;
+    if (numberValue(row[index.rank_payor_plantype]) > 0 && numberValue(row[index.network_score]) != null) entry.rankedRows += 1;
+    payorCounts.set(payor, entry);
+}
 const groups = new Map();
 const rankScores = new Map();
 
@@ -118,6 +129,14 @@ for (const row of rows) {
     const values = { ...row, networkScore: row.value, rankScore, enrollment: row.enrollment < 0 ? '' : row.enrollment, ...row.ratings };
     ratingLines.push(ratingsHeader.map((column) => csvCell(values[column])).join(','));
 }
+const payorLines = ['payor,rows,rankedRows'];
+for (const [payor, entry] of [...payorCounts.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    payorLines.push([payor, entry.rows, entry.rankedRows].map(csvCell).join(','));
+}
+const payorsDestination = path.join(__dirname, '..', 'data', 'payors.csv');
+fs.writeFileSync(payorsDestination, `${payorLines.join('\n')}\n`, 'utf8');
+console.log(JSON.stringify({ payors: payorCounts.size, destination: payorsDestination }));
+
 const ratingsDestination = path.join(__dirname, '..', 'data', 'network_ratings.csv');
 fs.writeFileSync(ratingsDestination, `${ratingLines.join('\n')}\n`, 'utf8');
 console.log(JSON.stringify({ rows: rows.length, destination: ratingsDestination }));

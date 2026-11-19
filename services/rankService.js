@@ -9,6 +9,7 @@ const zod_1 = require("zod");
 const countyNeighbors_1 = require("./countyNeighbors");
 const entityResolve_1 = require("./entityResolve");
 const rankModel_1 = require("./rankModel");
+const countyResolve_1 = require("./countyResolve");
 const rankingsStore_1 = require("./rankingsStore");
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.answerRank = answerRank;
@@ -138,11 +139,34 @@ function payorNameStem(name) {
 /** Payors from `payors` that the question names, by full name or name stem. */
 function payorsNamedIn(message, payors) {
     const text = payorKey(message);
-    return [...new Set(payors)].filter((payor) => {
+    const names = [...new Set(payors)];
+    const exact = names.filter((payor) => {
         const full = payorKey(payor);
         const stem = payorNameStem(payor);
         return (full && text.includes(full)) || (stem && text.includes(stem));
     });
+    if (exact.length) return exact;
+    // Typos such as "cenetne": a close spelling counts only when exactly one payor fits.
+    const words = String(message || '').toLowerCase().match(/[a-z]{5,}/g) || [];
+    const close = names.filter((payor) => {
+        const targets = [payorNameStem(payor), payorKey(String(payor).split(/[\s,]+/)[0])].filter((value) => value.length >= 5);
+        return words.some((word) => targets.some((target) => typoDistance(word, target) <= (target.length >= 9 ? 2 : 1)));
+    });
+    return close.length === 1 ? close : [];
+}
+
+/** Edit distance with adjacent swaps: "cenetne" is 1 away from "centene". */
+function typoDistance(a, b) {
+    const rows = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+    for (let j = 1; j <= b.length; j += 1) rows[0][j] = j;
+    for (let i = 1; i <= a.length; i += 1) {
+        for (let j = 1; j <= b.length; j += 1) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            rows[i][j] = Math.min(rows[i - 1][j] + 1, rows[i][j - 1] + 1, rows[i - 1][j - 1] + cost);
+            if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) rows[i][j] = Math.min(rows[i][j], rows[i - 2][j - 2] + 1);
+        }
+    }
+    return rows[a.length][b.length];
 }
 
 /** The payor-like word in "what is the acme ranking in X county", for a "not ranked here" reply. */
@@ -258,7 +282,8 @@ function resolveCounty(message, counties) {
     }
     const trail = trailingCounty(text, counties);
     if (trail) hits.push({ index: text.length, name: trail });
-    if (!hits.length) return '';
+    // Spelling mistakes, abbreviations, and city names: "hariss county", "Ft Bend", "San Antonio".
+    if (!hits.length) return (0, countyResolve_1.findCounty)(text, [...counties.values()]);
     hits.sort((a, b) => a.index - b.index);
     return hits[hits.length - 1].name;
 }
@@ -405,6 +430,15 @@ function orderedPayors(rows) {
         rank: published ? row.publishedRank : index + 1,
         focal: false,
     }));
+}
+
+/** "both plan types", "all plan types", or HMO and PPO named together (typos such as "HMP" included). */
+function wantsAllPlanTypes(message) {
+    const text = String(message || '').toLowerCase();
+    if (/\b(both|all|every|each)\s+(?:the\s+)?plan\s*-?\s*types?\b/.test(text)) return true;
+    const hmo = /\b(hmo|hmp|hm0|hom|hmo-?pos)\b/.test(text);
+    const ppo = /\b(ppo|pp0|ppos)\b/.test(text);
+    return hmo && ppo;
 }
 
 function listSections(message, rows) {
@@ -600,7 +634,8 @@ function baselineBody(session, pack, assumptions) {
     }
     const gap = result.baseline.reachToNextBetterRank;
     const cushion = result.baseline.reachBeforeWorseRank;
-    const names = [focal, ...competitors].map((row) => row.payor).join(', ');
+    // Competitors only: the selected payor is never listed as its own competitor.
+    const names = [...new Set(competitors.map((row) => row.payor).filter((payor) => payor !== focal.payor))].join(', ');
     const answer = published
         ? [
             `${focal.payor} ${session.planType} is rank ${published.rank} of ${published.of} in ${session.county} County, Texas, in terms of current Network.`,
@@ -791,6 +826,21 @@ function statewideRankTable(payor, planType, data) {
     };
 }
 
+/** Statewide ranks for every plan type a payor has: one summary line and one titled table each. */
+function statewideAllPlanTypes(payor, data) {
+    const types = uniqueSorted(data.rankings.filter((row) => row.payor === payor).map((row) => row.planType));
+    const parts = types.map((type) => ({ type, result: statewideRankTable(payor, type, data) })).filter((part) => part.result.rows?.length);
+    if (!parts.length) return { kind: 'needs_data', answer: `No published rankings were found for ${payor} in Texas.` };
+    return {
+        kind: 'baseline',
+        answer: parts.map((part) => part.result.answer.replace(/\s*Name a county for its full payor list\.$/, '')).join('\n\n') + '\n\nName a county for its full payor list.',
+        focal: { payor },
+        tables: parts.map((part) => ({ title: `${payor} (${part.type})`, columns: part.result.columns, rows: part.result.rows })),
+        assumptions: parts[0].result.assumptions,
+        references: parts[0].result.references,
+    };
+}
+
 function answerStatewide({ message, earlier, previous, scope, data, interpreted }) {
     if (!data.rankings.length) {
         return {
@@ -799,6 +849,16 @@ function answerStatewide({ message, earlier, previous, scope, data, interpreted 
             expectedFiles: rankingsStore_1.RANK_FILE_HELP,
             assumptions: ['Competitor networks are held constant unless you name a competitor change.'],
         };
+    }
+    if (wantsAllPlanTypes(message)) {
+        const allPayors = [...new Set(data.rankings.map((row) => row.payor))];
+        const named = payorsNamedIn(message, allPayors);
+        const fallback = [...(scope.data.payors || []), previous?.payor].map((payor) => payor && matchPayor(payor, data.rankings)).find(Boolean);
+        const payor = named.length === 1 ? named[0] : fallback;
+        if (payor) {
+            const saved = remember(previous, { payor, question: message });
+            return { ...statewideAllPlanTypes(payor, data), sessionId: saved.id };
+        }
     }
     const focalChoice = chooseFocal(`${message} ${earlier} ${previous?.question || ''} ${previous?.payor || ''} ${previous?.planType || ''}`, scope.data, data.rankings);
     if (focalChoice.clarify && !(previous?.payor && previous?.planType)) {
@@ -976,18 +1036,26 @@ async function answerRank(input, deps) {
         };
     }
     const listing = listRequest(message);
-    if (listing && (!listing.countyOnly || fromLatest)) {
+    // "for HMO and PPO", "both plan types": one answer line per plan type, from the county list.
+    const allTypes = wantsAllPlanTypes(message);
+    const listView = listing || { limit: null, highest: false, countyOnly: false };
+    if ((listing && (!listing.countyOnly || fromLatest)) || allTypes) {
         const countyRows = data.rankings.filter((row) => samePlace(row, county));
-        const sections = listSections(message, countyRows);
+        const sections = listSections(allTypes ? '' : message, countyRows);
         if (!sections.length) {
             return { kind: 'needs_data', answer: `No Texas rankings are loaded for ${county} County.`, expectedFiles: rankingsStore_1.RANK_FILE_HELP };
         }
         // A payor named in the question ("what is the centene ranking in dallas county") gets the answer;
         // the full list stays available in the chart and table with that payor highlighted.
-        const named = payorsNamedIn(message, countyRows.map((row) => row.payor));
+        let named = payorsNamedIn(message, countyRows.map((row) => row.payor));
+        if (!named.length && (allTypes || /\b(we|our|us)\b/i.test(message))) {
+            // "where do we rank", "both plan types": our payor from the request scope (or from earlier in the chat).
+            const wanted = [...(scope.data.payors || []), previous?.payor].filter(Boolean);
+            named = [...new Set(wanted.map((payor) => matchPayor(payor, countyRows)).filter(Boolean))];
+        }
         const total = sections.reduce((sum, section) => sum + section.standings.length, 0);
         const standings = sections.flatMap((section) => {
-            const rows = listing.highest || !listing.limit ? section.standings : section.standings.slice(0, listing.limit);
+            const rows = listView.highest || !listView.limit ? section.standings : section.standings.slice(0, listView.limit);
             return rows.map((row) => ({
                 ...row,
                 focal: named.includes(row.payor),
@@ -996,7 +1064,7 @@ async function answerRank(input, deps) {
             }));
         });
         const focalRows = standings.filter((row) => row.focal).sort((a, b) => a.rank - b.rank);
-        let answer = sections.map((section) => formatList(county, section, listing)).join(' ');
+        let answer = sections.map((section) => formatList(county, section, listView)).join(' ');
         if (focalRows.length) {
             answer = focalRows
                 .map((row) => `${row.payor.endsWith(')') ? row.payor : `${row.payor} (${row.planType})`} is rank ${row.rank} of ${total} in ${county} County, Texas.`)

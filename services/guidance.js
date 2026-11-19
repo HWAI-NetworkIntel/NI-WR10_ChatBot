@@ -18,6 +18,9 @@ const WRITE = /\b(update|delete|insert|modify|edit|alter|truncate|drop|overwrite
 
 const TABLE_EDIT = /\b(add|remove|drop|hide|include|show)\b(?:\s+\S+){0,6}\s+columns?\b/i
 
+// Abuse and insults. Kept to clear cases so network questions are never caught.
+const ABUSE = /\b(f+u+c+k+\w*|fck\w*|f\*+k\w*|motherf\w+|shit\w*|bullshit|bitch\w*|bastard\w*|asshole\w*|dickhead|cunt\w*|wtf|stfu|piss off|screw you|shut up|go to hell|you suck|useless (?:bot|tool|assistant)|stupid (?:bot|tool|assistant)|idiot\w*|moron\w*|dumbass)\b/i
+
 const SCOPE ='I answer read-only questions about Texas Medicare Advantage provider networks: payor rankings by county, provider and hospital counts, specialties, and what-if network changes.'
 
 const EXAMPLES = [
@@ -45,6 +48,7 @@ function dashboardLinks() {
 /** 'injection', 'write', or '' when the question is fine. */
 function guardrailReason(text) {
   const value = String(text || '')
+  if (ABUSE.test(value)) return 'abuse'
   if (INJECTION.test(value)) return 'injection'
   // "drop the rank column" edits the answer table, not the database.
   if (TABLE_EDIT.test(value) && !/\b(database|db|schema|sql)\b/i.test(value)) return ''
@@ -54,10 +58,14 @@ function guardrailReason(text) {
 
 /** The reply for a blocked question. `answer`, `message`, and `content` all carry the text for every endpoint. */
 function guardrailReply(reason) {
-  const lead = reason === 'injection'
-    ? "I can't set aside how I work."
-    : "I can't change network data. This assistant is read-only."
-  const answer = `${lead} ${SCOPE} Try one of the questions below, or open a dashboard for provider-level detail.`
+  const lead = {
+    abuse: "Let's keep it professional.",
+    injection: "I can't set aside how I work.",
+  }[reason] || "I can't change network data. This assistant is read-only."
+  const close = reason === 'abuse'
+    ? 'Try one of the questions below, or open the PNC dashboard for provider-level detail.'
+    : 'Try one of the questions below, or open a dashboard for provider-level detail.'
+  const answer = `${lead} ${SCOPE} ${close}`
   return {
     kind: 'refused',
     reason,
@@ -66,16 +74,35 @@ function guardrailReply(reason) {
     content: answer,
     suggestions: EXAMPLES,
     suggestionField: 'question',
-    links: dashboardLinks(),
+    links: pncFirstLinks(),
   }
 }
 
 const GUIDED_KINDS = new Set(['cannot_answer', 'error', 'needs_data'])
 
+const OUT_OF_SCOPE = 'That detail is outside what this assistant can answer. It covers network rankings, provider counts by county, and what to improve to raise your rank. For provider and hospital level detail, open the PNC dashboard.'
+
+/** Dashboards for detail the assistant does not hold, PNC first. */
+function pncFirstLinks() {
+  const links = dashboardLinks()
+  return [...links.filter((link) => /^PNC/.test(link.label)), ...links.filter((link) => !/^PNC/.test(link.label))]
+}
+
+/** A data question with no rows, or one the SQL step could not answer: a general reply, not "no matching data". */
+function isOutOfScope(result) {
+  if (result.kind === 'cannot_answer') return true
+  return result.kind === 'data' && Array.isArray(result.rows) && result.rows.length === 0 && !result.tables?.length
+}
+
 /** Add dashboard links to answers that could not be completed. */
 function withGuidance(result) {
-  if (!result || typeof result !== 'object' || !GUIDED_KINDS.has(result.kind) || result.links) return result
+  if (!result || typeof result !== 'object') return result
+  if (isOutOfScope(result)) {
+    // Query details are dropped too: there is nothing useful to show in the notes.
+    return { kind: 'out_of_scope', answer: OUT_OF_SCOPE, message: OUT_OF_SCOPE, content: OUT_OF_SCOPE, links: pncFirstLinks() }
+  }
+  if (!GUIDED_KINDS.has(result.kind) || result.links) return result
   return { ...result, links: dashboardLinks() }
 }
 
-module.exports = { guardrailReason, guardrailReply, withGuidance, dashboardLinks, EXAMPLES }
+module.exports = { guardrailReason, guardrailReply, withGuidance, dashboardLinks, EXAMPLES, OUT_OF_SCOPE }

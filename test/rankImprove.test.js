@@ -31,7 +31,10 @@ const dashboard = {
 test('a county answer gives one side-by-side table per competitor, improvable measures only', () => {
   const result = improveRank({ county: 'Harris' }, dashboard, deps)
   assert.equal(result.kind, 'improvement')
-  assert.equal(result.answer, 'Molina Healthcare, Inc. (HMO) is rank 3 of 3 in Harris County.')
+  // Insight first: where we stand and the biggest lever, then what was assumed from the dashboard.
+  assert.ok(result.answer.startsWith('Molina Healthcare, Inc. (HMO) is rank 3 of 3 in Harris County. The biggest lever to pass Next Health (HMO) is '), result.answer)
+  assert.ok(result.answer.includes('\n\nAssumed: your dashboard payor, Molina Healthcare, Inc. · plan type HMO, from your dashboard.'), result.answer)
+  assert.doesNotMatch(result.answer, /\*\*|_Assumed/)
   assert.equal(result.columns, undefined)
   assert.equal(result.markdown, undefined)
   const [pass, leader] = result.tables

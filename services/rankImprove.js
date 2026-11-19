@@ -20,6 +20,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { parseCsv } = require('./rankingsStore')
 const { TERMS } = require('./terminology')
+const { canonicalCounty } = require('./countyResolve')
 
 const METRICS = [
   { column: 'pcp_npi_count_without_low_exclude_hosp', label: TERMS.pcpBreadth, drives: true },
@@ -149,6 +150,7 @@ function drivingGaps(focal, other) {
 
 /** Payor and plan type from the question, else the dashboard; ask when it is still ambiguous. */
 function resolveFocal(request, context, rows) {
+  const assumed = []
   const pairs = Array.isArray(context?.payorsCrossPlanTypes) ? context.payorsCrossPlanTypes : []
   let payor = String(request.payor || '').trim()
   if (payor) {
@@ -161,6 +163,7 @@ function resolveFocal(request, context, rows) {
       return { clarify: { answer: 'Which payor should I compare against its competitors?', suggestions: dashboard.length ? dashboard : unique(rows.map((row) => row.payor)).slice(0, 40), field: 'payor' } }
     }
     payor = rows.find((row) => samePayor(dashboard[0], row.payor))?.payor || dashboard[0]
+    assumed.push(`your dashboard payor, ${payor}`)
   }
   let planType = canonicalPlanType(request.planType)
   if (!planType) {
@@ -169,8 +172,9 @@ function resolveFocal(request, context, rows) {
     const choices = fromDashboard.length ? fromDashboard : fromData
     if (choices.length !== 1) return { clarify: { answer: `Which plan type should I use for ${payor}?`, suggestions: choices.length ? choices : fromData, field: 'planType' } }
     planType = choices[0]
+    assumed.push(fromDashboard.length ? `plan type ${planType}, from your dashboard` : `plan type ${planType}, the only one ${payor} is ranked in`)
   }
-  return { payor, planType }
+  return { payor, planType, assumed }
 }
 
 function countyComparison(rows, focal, request) {
@@ -200,6 +204,13 @@ function countyComparison(rows, focal, request) {
   const leader = compare[1]
   const lines = [`${label(focal)} is rank ${focal.rank} of ${payorsRanked} in ${county} County.`]
   const tables = []
+  const lever = drivingGaps(focal, closest)[0]
+  // Lead with the insight: where we stand and the single biggest lever against the closest network.
+  if (lever) {
+    lines[0] = focal.rank < closest.rank
+      ? `${lines[0]} The biggest risk to the lead is ${lever.metric.label}, where ${label(closest)} is ahead (${neededText(lever)} to match).`
+      : `${lines[0]} The biggest lever to pass ${label(closest)} is ${lever.metric.label}: ${neededText(lever)}.`
+  }
   if (focal.rank < closest.rank) {
     const gaps = drivingGaps(focal, closest)
     if (gaps.length) tables.push(gapTable(`To keep the lead over ${label(closest)} (rank ${closest.rank}), close the areas where it is ahead`, focal, closest, gaps))
@@ -293,7 +304,7 @@ function statewideSummary(rows, payor, planType) {
   // Smallest gap to the next network first; the gap itself is not shown.
   lines.sort((a, b) => a.scoreGap - b.scoreGap || a.county.localeCompare(b.county))
   const common = [...gapCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
-  const parts = [`${payor} (${planType}) is ranked in ${mine.length} Texas counties and is rank 1 in ${leads}.`]
+  const parts = [`${payor} (${planType}) is ranked in ${mine.length} Texas counties and is rank 1 in ${leads}.${lines.length ? ` Closest to moving up: ${lines[0].county} County.` : ''}`]
   if (common.length) {
     parts.push(`\nWhat to improve most often to pass the next network:\n${common.map(([name, count]) => `• ${name} (behind in ${count} ${count === 1 ? 'county' : 'counties'})`).join('\n')}`)
   }
@@ -301,7 +312,7 @@ function statewideSummary(rows, payor, planType) {
     parts.push(`\nCounties closest to moving up:\n${lines.slice(0, 5).map((line) => `• ${line.county}: rank ${line.rank} of ${line.payorsRanked}, next is ${line.nextBetter}`).join('\n')}`)
   }
   parts.push('\nName a county to see exactly what to improve there.')
-  return { answer: parts.join('\n') }
+  return { answer: parts.join('\n'), closest: lines.slice(0, 5).map((line) => line.county) }
 }
 
 /**
@@ -318,12 +329,19 @@ function improveRank(request = {}, context = {}, deps = {}) {
     return { kind: 'clarify', answer: focalChoice.clarify.answer, suggestions: focalChoice.clarify.suggestions, suggestionField: focalChoice.clarify.field }
   }
   const { payor, planType } = focalChoice
-  const countyName = String(request.county || '').replace(/\s+county$/i, '').replace(/,?\s*(texas|tx)$/i, '').trim()
-  const base = { focal: { payor, planType }, assumptions: METHOD, references: REFERENCES, sql: '' }
+  const typed = String(request.county || '').replace(/\s+county$/i, '').replace(/,?\s*(texas|tx)$/i, '').trim()
+  // "hariss", "Ft Bend", "San Antonio" -> the county the user meant.
+  const countyName = typed ? (canonicalCounty(typed, unique(rows.map((row) => row.county))) || typed) : ''
+  const assumed = [
+    ...focalChoice.assumed,
+    ...(countyName ? [] : ['every Texas county']),
+    ...(countyName && request.countyFromConversation ? [`${countyName} County, from earlier in the conversation`] : []),
+  ]
+  const base = { focal: { payor, planType }, assumptions: METHOD, references: REFERENCES, sql: '', assumed }
   if (!countyName) {
     const summary = statewideSummary(rows, payor, planType)
     if (!summary) return { kind: 'needs_data', answer: `${payor} has no published ${planType} rankings in Texas.`, ...base }
-    return { kind: 'improvement', ...base, ...summary }
+    return { kind: 'improvement', ...base, ...summary, answer: withAssumed(summary.answer, assumed) }
   }
   // Ranks are county-wide: every payor × plan type entry competes in one list (Stage2_dynamic RANK_SCOPE).
   const countyRows = rows.filter((row) => compact(row.county) === compact(countyName))
@@ -346,7 +364,80 @@ function improveRank(request = {}, context = {}, deps = {}) {
     ...base,
     geography: { county: focal.county, state: 'TX' },
     ...comparison,
+    answer: withAssumed(comparison.answer, assumed),
   }
 }
 
-module.exports = { improveRank, loadRatings, METRICS }
+/** "Assumed: your dashboard payor, Humana Inc. · every Texas county." when a default filled a gap in the question. */
+function withAssumed(answer, assumed) {
+  if (!assumed?.length) return answer
+  return `${answer}\n\nAssumed: ${assumed.join(' · ')}. Name a payor, plan type, or county to change this.`
+}
+
+/**
+ * "Where can we move up most easily?" — every county where the payor is not rank 1, ordered by how close
+ * the next network ahead is, with the single measure that would most help pass it.
+ * request: { payor?, planType?, limit? }. Scores order the list but are not shown, like the statewide summary.
+ */
+function findOpportunities(request = {}, context = {}, deps = {}) {
+  const rows = (deps.loadRatings || loadRatings)()
+  if (!rows.length) {
+    return { kind: 'needs_data', answer: 'Network ratings are not loaded. Run scripts/import_ranked_dashboard.js with the provider dashboard extract to create data/network_ratings.csv.' }
+  }
+  const focalChoice = resolveFocal(request, context, rows)
+  if (focalChoice.clarify) {
+    return { kind: 'clarify', answer: focalChoice.clarify.answer, suggestions: focalChoice.clarify.suggestions, suggestionField: focalChoice.clarify.field }
+  }
+  const { payor, planType } = focalChoice
+  const limit = Math.min(Math.max(Math.floor(Number(request.limit)) || 5, 1), 20)
+  const byCounty = new Map()
+  for (const row of rows) {
+    if (!byCounty.has(row.county)) byCounty.set(row.county, [])
+    byCounty.get(row.county).push(row)
+  }
+  const mine = rows.filter((row) => samePayor(payor, row.payor) && row.planType === planType)
+  const base = { focal: { payor, planType }, assumptions: METHOD, references: REFERENCES, sql: '', assumed: focalChoice.assumed }
+  if (!mine.length) return { kind: 'needs_data', answer: `${payor} has no published ${planType} rankings in Texas.`, ...base }
+  const items = []
+  for (const focal of mine) {
+    const peers = byCounty.get(focal.county) || []
+    const next = peers.filter((row) => row.rank < focal.rank && !samePayor(payor, row.payor)).sort((a, b) => b.rank - a.rank)[0]
+    if (!next) continue
+    const lever = drivingGaps(focal, next)[0]
+    items.push({
+      county: focal.county,
+      rank: focal.rank,
+      payorsRanked: peers.length,
+      next: `${label(next)}, rank ${next.rank}`,
+      actionable: Boolean(lever),
+      lever: lever ? `${lever.metric.label}: ${neededText(lever)}` : 'Not on improvable measures',
+      scoreGap: (next.networkScore ?? 0) - (focal.networkScore ?? 0),
+    })
+  }
+  if (!items.length) {
+    return { kind: 'improvement', subtype: 'opportunity', ...base, answer: withAssumed(`${payor} (${planType}) is rank 1 in all ${mine.length} counties where it is ranked. There is no network ahead to pass.`, focalChoice.assumed), tables: [], closest: [] }
+  }
+  // Counties with a measure to act on first, then the smallest gap to the next network.
+  items.sort((a, b) => Number(b.actionable) - Number(a.actionable) || a.scoreGap - b.scoreGap || a.county.localeCompare(b.county))
+  const top = items.slice(0, limit)
+  const first = top[0]
+  const headline = `Best chance to move up: ${first.county} County. ${payor} (${planType}) is rank ${first.rank} of ${first.payorsRanked}, just behind ${first.next}. Biggest lever: ${first.lever}.`
+  const answer = [
+    headline,
+    `${payor} (${planType}) is below rank 1 in ${items.length} of ${mine.length} ranked counties. These ${top.length} are closest to passing the next network.`,
+  ].join('\n')
+  return {
+    kind: 'improvement',
+    subtype: 'opportunity',
+    ...base,
+    answer: withAssumed(answer, focalChoice.assumed),
+    tables: [{
+      title: 'Counties closest to moving up a rank',
+      columns: ['County', 'Rank', 'Next network ahead', 'Biggest lever'],
+      rows: top.map((item) => [item.county, `${item.rank} of ${item.payorsRanked}`, item.next, item.lever]),
+    }],
+    closest: top.map((item) => item.county),
+  }
+}
+
+module.exports = { improveRank, findOpportunities, loadRatings, METRICS }

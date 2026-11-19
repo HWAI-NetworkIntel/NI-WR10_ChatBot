@@ -1,4 +1,5 @@
 ﻿const { AppError } = require('../utils/AppError')
+const { scenarioResult } = require('./scenarioRanks')
 const { scenarioFromBody, scenarioIssue } = require('./stage2Params')
 const { runStage2 } = require('./stage2Runner')
 
@@ -6,6 +7,8 @@ async function predictNetworkImpact(input) {
   const scenario = scenarioFromBody(input)
   const issue = scenarioIssue(scenario)
   if (issue) throw new AppError(400, 'INVALID_SCOPE', issue)
+  const published = scenarioResult(scenario)
+  if (published) return published
   let result
   try {
     result = await runStage2(scenario)
