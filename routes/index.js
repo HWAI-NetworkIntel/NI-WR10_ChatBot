@@ -1,6 +1,9 @@
 ﻿const express = require('express')
 const { config } = require('../config/config')
 const { answerRank, looksLikeRankQuestion, rankOptions, refusesWrite } = require('../services/rankService')
+const { answerFromStage2 } = require('../services/stage2Chat')
+const { planQuestion, historyFromBody } = require('../services/conversationPlanner')
+const { buildRankTable } = require('../services/rankTable')
 
 function loadOptional(name) {
   try {
@@ -36,6 +39,35 @@ function continuesRank(text) {
   if (looksLikeRankQuestion(value)) return true
   return value.split(/\s+/).length <= 4
 }
+/** The planner never blocks an answer: on any failure the endpoint keeps its old routing. */
+async function safePlan(input) {
+  try {
+    return await planQuestion(input)
+  } catch {
+    return null
+  }
+}
+
+/** Chat endpoints render `answer` / `content` as markdown, so the table goes there too. */
+function chatTable(table) {
+  const { markdown, ...rest } = table
+  return { ...rest, answer: markdown ? `${table.answer}\n\n${markdown}` : table.answer }
+}
+
+/** Stage 2 (Python) first, then the roster rank model. */
+async function rankThread(body, message, earlier) {
+  const stage2 = await answerFromStage2({ ...body, message, earlier })
+  if (stage2?.answer) return { status: stage2.kind === 'error' ? 422 : 200, payload: stage2 }
+  const result = await answerRank({
+    ...body,
+    message: stage2?.message || message,
+    earlier,
+    ...(stage2?.change ? { change: stage2.change } : {}),
+  })
+  const { status, ...payload } = result
+  return { status: status || 200, payload }
+}
+
 const NO_DOCUMENTED_TABLES = 'the login cannot see any documented table'
 
 const router = express.Router()
@@ -77,9 +109,25 @@ router.post('/ask', async (req, res) => {
   if (refusesWrite(parsed.data.question)) {
     return res.json({ kind: 'refused', message: "I can't change the network tables. Ask a read-only question." })
   }
-  if (!getSchemaContext()) return res.status(503).json({ error: 'Schema is not loaded' })
   try {
-    return res.json(await answerQuestion(parsed.data))
+    const { history = [], ...input } = parsed.data
+    const plan = await safePlan({ ...input, history })
+    if (plan && refusesWrite(plan.standalone)) {
+      return res.json({ kind: 'refused', message: "I can't change the network tables. Ask a read-only question." })
+    }
+    if (plan?.route === 'table') {
+      const { markdown: _markdown, ...table } = buildRankTable(plan.table, input)
+      return res.json({ ...table, standalone: plan.standalone })
+    }
+    if (plan?.route === 'rank') {
+      const earlier = userTexts(history).join('\n')
+      const { status, payload } = await rankThread({ ...req.body, history: undefined }, plan.standalone, earlier)
+      return res.status(status).json({ ...payload, standalone: plan.standalone })
+    }
+    if (!getSchemaContext()) return res.status(503).json({ error: 'Schema is not loaded' })
+    const question = (plan?.standalone || input.question).slice(0, 500)
+    const result = await answerQuestion({ ...input, question })
+    return res.json(plan ? { ...result, standalone: question } : result)
   } catch (err) {
     console.error(JSON.stringify({ event: 'ask', name: err instanceof Error ? err.name : 'Error' }))
     return res.status(500).json({ kind: 'error', message: ASK_ERROR_MESSAGE })
@@ -109,9 +157,9 @@ router.post('/rank', async (req, res) => {
     const texts = userTexts(body.messages)
     const message = String(body.message || body.question || texts.at(-1) || '').trim()
     const earlier = body.earlier || texts.slice(0, -1).join('\n')
-    const result = await answerRank({ ...body, message, earlier })
-    const status = result.status || 200
-    const { status: _status, ...payload } = result
+    const plan = await safePlan({ ...body, question: message, history: historyFromBody(body) })
+    if (plan?.route === 'table') return res.json({ ...chatTable(buildRankTable(plan.table, body)), standalone: plan.standalone })
+    const { status, payload } = await rankThread(body, message, earlier)
     return res.status(status).json(payload)
   } catch (err) {
     console.error(JSON.stringify({ event: 'rank', name: err instanceof Error ? err.name : 'Error' }))
@@ -129,13 +177,20 @@ router.post('/llm/chat', async (req, res) => {
   if (refusesWrite(userText) || refusesWrite(parsed.data.system)) {
     return res.json({ content: "I can't change the network tables. Ask a read-only rank question.", kind: 'refused' })
   }
-  const rankThread = looksLikeRankQuestion(userText) || (texts.some((text) => looksLikeRankQuestion(text)) && continuesRank(userText))
-  if (rankThread && !/\bjson\b/i.test(parsed.data.system || '')) {
+  // A caller asking for JSON controls its own format, so it skips the planner and rank routing.
+  const callerFormat = /\bjson\b/i.test(parsed.data.system || '')
+  const plan = callerFormat ? null : await safePlan({ ...req.body, question: userText, history: historyFromBody(parsed.data) })
+  if (plan?.route === 'table') {
+    const table = chatTable(buildRankTable(plan.table, req.body))
+    return res.json({ content: table.answer, ...table, standalone: plan.standalone })
+  }
+  const rankLike = plan?.route === 'rank'
+    || looksLikeRankQuestion(userText)
+    || (texts.some((text) => looksLikeRankQuestion(text)) && continuesRank(userText))
+  if (rankLike && !callerFormat) {
     try {
-      const result = await answerRank({ ...req.body, message: userText, earlier })
-      const status = result.status || 200
-      const { status: _status, ...body } = result
-      return res.status(status).json({ content: body.answer, ...body })
+      const { status, payload } = await rankThread(req.body, userText, earlier)
+      return res.status(status).json({ content: payload.answer, ...payload })
     } catch (err) {
       console.error(JSON.stringify({ event: 'rank', name: err instanceof Error ? err.name : 'Error' }))
       return res.status(500).json({ error: "I couldn't evaluate that rank change." })

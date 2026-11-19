@@ -5,6 +5,7 @@ const rateLimit = require('express-rate-limit')
 const helmet = require('helmet')
 const { config } = require('./config/config')
 const routes = require('./routes')
+const { predict } = require('./controllers/networkImpactController')
 const { AppError } = require('./utils/AppError')
 const { errorHandler } = require('./utils/errorHandler')
 
@@ -27,6 +28,7 @@ app.use('/api', rateLimit({
     error: { code: 'RATE_LIMITED', message: 'Too many requests. Please try again later.' },
   }),
 }))
+app.post('/api/network-impact/predict', predict)
 app.use(routes)
 app.use((_req, _res, next) => next(new AppError(404, 'NOT_FOUND', 'Route not found.')))
 app.use(errorHandler)

@@ -72,6 +72,16 @@ function scope(message, extra = {}) {
     strict_1.equal(rows[0].publishedRank, null);
 });
 
+(0, node_test_1.test)('a rank question without a county is answered for every loaded county', async () => {
+    const harris = WIDE.map((row) => ({ ...row, county: 'Harris' }));
+    const result = await (0, rankService_1.answerRank)(scope('Smallest set of adds to reach rank 2?'), { rankings: WIDE.concat(harris), roster: WIDE_ROSTER });
+    strict_1.equal(result.suggestionField, undefined);
+    strict_1.equal(result.suggestions, undefined);
+    strict_1.match(result.answer, /Harris/);
+    strict_1.match(result.answer, /Houston/);
+    strict_1.doesNotMatch(result.answer, /Name the Texas county/);
+});
+
 (0, node_test_1.test)('suggests payors and plan types without selecting one', () => {
     const options = (0, rankService_1.rankOptions)({ q: 'Where do we rank in Houston County?' }, { rankings: WIDE, roster: [] });
     strict_1.equal(options.county, 'Houston');
@@ -278,6 +288,21 @@ const SMALL_GROUPS = [
     const missing = await (0, rankService_1.answerRank)(scope('How do we rank against payer X in Houston County?'), { rankings: WIDE, roster: WIDE_ROSTER });
     strict_1.equal(missing.kind, 'unavailable');
     strict_1.match(missing.answer, /No roster is loaded for X/);
+    const compared = await (0, rankService_1.answerRank)(scope('How do we rank against payer UnitedHealthcare in Houston County?'), { rankings: WIDE, roster: WIDE_ROSTER });
+    strict_1.equal(compared.kind, 'comparison');
+    strict_1.match(compared.answer, /Humana is rank 2/);
+    strict_1.match(compared.answer, /UnitedHealthcare is rank 1/);
+    strict_1.match(compared.answer, /behind UnitedHealthcare/);
+    const first = await (0, rankService_1.answerRank)(scope('Where do we rank in Houston County?'), { rankings: WIDE, roster: WIDE_ROSTER });
+    const swapped = await (0, rankService_1.answerRank)({
+        message: 'How do we rank against payer UnitedHealthcare in Houston County?',
+        payors: ['UnitedHealthcare'],
+        payorsCrossPlanTypes: [{ payor: 'UnitedHealthcare', planType: 'HMO' }],
+        sessionId: first.sessionId,
+    }, { rankings: WIDE, roster: WIDE_ROSTER });
+    strict_1.equal(swapped.kind, 'comparison');
+    strict_1.match(swapped.answer, /Humana is rank 2/);
+    strict_1.match(swapped.answer, /UnitedHealthcare is rank 1/);
 });
 
 (0, node_test_1.test)('a county reply selects that county, not the example county', async () => {
@@ -290,7 +315,8 @@ const SMALL_GROUPS = [
     ];
     const deps = { rankings, roster: [] };
     const asked = await (0, rankService_1.answerRank)(scope('which network has best and worst rank'), deps);
-    strict_1.equal(asked.kind, 'clarify');
+    strict_1.equal(asked.kind, 'baseline');
+    strict_1.equal(asked.suggestions, undefined);
     strict_1.match(asked.answer, /Harris/);
     strict_1.match(asked.answer, /Houston/);
     const harris = await (0, rankService_1.answerRank)(scope('Harris', { sessionId: asked.sessionId }), deps);

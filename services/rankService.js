@@ -95,7 +95,7 @@ function resetRankSessions() {
 }
 
 function looksLikeRankQuestion(text) {
-    return /\brank(?:ed|ing)?\b|\btop\s+\d+\b|terminat|health system|physician group|where do we (?:land|rank)|if we (?:add|remove|drop|terminate)|adjacent count|surrounding count|best network|against payer|small groups/i.test(String(text || ''));
+    return /\brank(?:s|ed|ing|ings)?\b|\btop\s+\d+\b|terminat|health system|physician group|where do we (?:land|rank)|if we (?:add|remove|drop|terminate)|adjacent count|surrounding count|best network|against payer|small groups/i.test(String(text || ''));
 }
 
 function refusesWrite(text) {
@@ -122,6 +122,13 @@ function matchPayor(name, rows) {
     if (exact) return exact;
     const partial = names.filter((payor) => payorKey(payor).includes(key) || key.includes(payorKey(payor)));
     return partial.length === 1 ? partial[0] : null;
+}
+
+function samePayor(left, right) {
+    const a = payorKey(left);
+    const b = payorKey(right);
+    if (!a || !b || a.length < 3 || b.length < 3) return false;
+    return a === b || a.includes(b) || b.includes(a);
 }
 
 function latestAsOf(rows) {
@@ -261,20 +268,19 @@ function countySample(counties) {
 }
 
 function countyClarify(counties, attempt) {
-    const { picked, total, all } = countySample(counties);
+    const { picked } = countySample(counties);
     const list = picked.join(', ');
-    const more = total > picked.length ? ` and ${total - picked.length} more` : '';
     if (attempt) {
         return {
-            answer: `"${attempt}" is not a loaded Texas county. Rank stays on the county you name and does not switch to a different county. Loaded counties include ${list}${more}.`,
-            suggestions: all,
+            answer: `"${attempt}" is not a loaded Texas county. Rank stays on the county you name and does not switch to a different county. You can use ${list}.`,
+            suggestions: picked,
         };
     }
     return {
         answer: list
-            ? `Name the Texas county. You can reply with the county name alone, such as ${picked[0]}. Rank is against competitor networks in that county. Loaded counties include ${list}${more}.`
+            ? `Name the Texas county. You can reply with the county name alone, such as ${picked[0]}. Rank is against competitor networks in that county.`
             : 'Name the Texas county. Rank is against competitor networks in that county.',
-        suggestions: all,
+        suggestions: picked,
     };
 }
 
@@ -326,7 +332,7 @@ function extractCloseRank(message) {
 }
 
 function extractAgainst(message) {
-    const match = /\bagainst\s+(?:payer\s+)?["']?([A-Za-z0-9][A-Za-z0-9 .&'-]*?)["']?(?=\s+in\b|[?.!]|$)/i.exec(message);
+    const match = /\b(?:against|versus|vs\.?|compared? (?:with|to))\s+(?:payer\s+|payor\s+)?["']?([A-Za-z0-9][A-Za-z0-9 .&'-]*?)["']?(?=\s+in\b|[?.!]|$)/i.exec(message);
     return match ? match[1].trim() : '';
 }
 
@@ -435,8 +441,39 @@ function catalogFor(roster, county, planType) {
         .map((row) => ({ ...row, source: 'roster' }));
 }
 
+function keepOurPayor(focalChoice, previous, against) {
+    let payor = focalChoice.payor || previous?.payor;
+    let planType = focalChoice.planType || previous?.planType;
+    if (against && payor && samePayor(payor, against) && previous?.payor && !samePayor(previous.payor, against)) {
+        payor = previous.payor;
+        planType = previous.planType || planType;
+    }
+    return { payor, planType };
+}
+
+function displayedRank(row, peers) {
+    const published = peers.every((item) => item.publishedRank != null);
+    if (published) return row.publishedRank;
+    return (0, rankModel_1.rankOf)(row.value, peers.filter((item) => item.payor !== row.payor).map((item) => item.value));
+}
+
+function comparisonSentence(ours, other, peers) {
+    const ourRank = displayedRank(ours, peers);
+    const theirRank = displayedRank(other, peers);
+    const gap = theirRank - ourRank;
+    const places = Math.abs(gap) === 1 ? 'place' : 'places';
+    const relation = gap === 0
+        ? `${ours.payor} and ${other.payor} are tied at rank ${ourRank}`
+        : gap > 0
+            ? `${ours.payor} ranks ${gap} ${places} ahead of ${other.payor}`
+            : `${ours.payor} ranks ${-gap} ${places} behind ${other.payor}`;
+    return `${ours.payor} is rank ${ourRank} and ${other.payor} is rank ${theirRank}. ${relation}`;
+}
+
 function chooseFocal(message, scope, rankings) {
-    const payors = scope.payors;
+    const against = extractAgainst(message);
+    const withoutTarget = against ? scope.payors.filter((payor) => !samePayor(payor, against)) : scope.payors;
+    const payors = withoutTarget.length ? withoutTarget : scope.payors;
     const mentioned = payors.filter((payor) => message.toLowerCase().includes(payor.toLowerCase()));
     const payor = mentioned.length === 1 ? mentioned[0] : payors.length === 1 ? payors[0] : null;
     if (!payor) return { clarify: `Which payor is "we"? Choose one of ${payors.join(', ')}.` };
@@ -664,6 +701,129 @@ function rankOptions(input = {}, deps) {
     };
 }
 
+function countiesWithRoster(data, planType, payor, metric) {
+    const names = [...knownCounties(data.rankings).values()].sort((a, b) => a.localeCompare(b));
+    return names.filter((county) => {
+        const slice = sliceRows(data.rankings, county, planType).filter((row) => row.metric === metric);
+        return Boolean(matchPayor(payor, slice));
+    });
+}
+
+function countyPack(data, county, planType, payor, metric) {
+    const slice = sliceRows(data.rankings, county, planType).filter((row) => row.metric === metric);
+    const rankingsPayor = matchPayor(payor, slice);
+    if (!rankingsPayor) return null;
+    const { focal, competitors } = aggregate(slice, rankingsPayor);
+    if (!focal) return null;
+    const catalog = catalogFor(data.roster, county, planType).map((row) => entityRecord(row, rankingsPayor, competitors.map((item) => item.payor)));
+    return { county, focal, competitors, catalog };
+}
+
+/** A rank question with no county is answered for every loaded county. The caller is not asked to pick one. */
+function answerStatewide({ message, earlier, previous, scope, data, interpreted }) {
+    if (!data.rankings.length) {
+        return {
+            kind: 'needs_data',
+            answer: 'Rankings are not loaded. Add data/rankings.csv for the current roster position and data/roster.csv for each health system or group reach.',
+            expectedFiles: rankingsStore_1.RANK_FILE_HELP,
+            assumptions: ['Competitor networks are held constant unless you name a competitor change.'],
+        };
+    }
+    const focalChoice = chooseFocal(`${message} ${earlier} ${previous?.question || ''} ${previous?.payor || ''} ${previous?.planType || ''}`, scope.data, data.rankings);
+    if (focalChoice.clarify && !(previous?.payor && previous?.planType)) {
+        const saved = remember(previous, { question: message });
+        return { kind: 'clarify', sessionId: saved.id, answer: focalChoice.clarify };
+    }
+    const selected = keepOurPayor(focalChoice, previous, interpreted.against);
+    const payor = selected.payor;
+    const planType = selected.planType;
+    const typed = data.rankings.filter((row) => row.planType.toLowerCase() === planType.toLowerCase() && (row.state || 'TX').toUpperCase() === 'TX');
+    const metrics = [...new Set(typed.map((row) => row.metric))];
+    const metricSource = `${message} ${earlier} ${previous?.question || ''}`.toLowerCase();
+    const metric = metrics.find((item) => metricSource.includes(item.toLowerCase())) || (metrics.length === 1 ? metrics[0] : null);
+    if (!metric) {
+        const saved = remember(previous, { payor, planType, question: message });
+        return { kind: 'clarify', sessionId: saved.id, answer: `Which metric should set the rank? Loaded metrics: ${metrics.join(', ')}.` };
+    }
+    const packs = countiesWithRoster(data, planType, payor, metric).map((county) => countyPack(data, county, planType, payor, metric)).filter(Boolean);
+    if (!packs.length) {
+        return { kind: 'needs_data', answer: `No Texas rankings are loaded for ${payor} ${planType}.`, expectedFiles: rankingsStore_1.RANK_FILE_HELP };
+    }
+    const target = interpreted.targetRank || interpreted.closeRank || 2;
+    let kind = 'baseline';
+    let lines = [];
+    if (interpreted.intent === 'prescribe' || interpreted.intent === 'safe_removals') {
+        kind = 'prescription';
+        lines = packs.map((pack) => {
+            if (interpreted.intent === 'safe_removals') {
+                const removals = (0, rankModel_1.safeRemovals)({ focalValue: pack.focal.value, competitors: pack.competitors, candidates: pack.catalog.filter((row) => row.onFocal) });
+                return `${pack.county}: ${removals.length ? removals.map((row) => row.name).join(', ') : 'no rank-safe removal'}`;
+            }
+            const additions = (0, rankModel_1.planAdditions)({
+                focalValue: pack.focal.value,
+                competitors: pack.competitors,
+                candidates: pack.catalog.filter((row) => !row.onFocal),
+                targetRank: interpreted.targetRank || 1,
+            });
+            const detail = additions.picks.length
+                ? additions.picks.map((row) => `${row.name} gains ${comma(row.marginalReach)} and lands at rank ${row.predictedRank}`).join('; ')
+                : 'none with a positive marginal reach';
+            return `${pack.county}: ${detail}`;
+        });
+    } else if (interpreted.intent === 'sensitivity' || interpreted.closeRank) {
+        kind = 'sensitivity';
+        lines = packs.map((pack) => {
+            const gap = (0, rankModel_1.reachToRank)(pack.focal.value, pack.competitors, target);
+            if (gap.already) return `${pack.county}: already rank ${gap.current}`;
+            if (gap.gap == null) return `${pack.county}: rank ${target} is not defined`;
+            return `${pack.county}: ${comma(gap.gap)} beneficiary reach from rank ${target} (now rank ${gap.current})`;
+        });
+    } else if (interpreted.intent === 'against' && interpreted.against) {
+        kind = 'comparison';
+        lines = packs.map((pack) => {
+            const peers = [pack.focal, ...pack.competitors];
+            const other = peers.find((row) => row.payor !== pack.focal.payor && samePayor(row.payor, interpreted.against));
+            if (!other) return `${pack.county}: No roster is loaded for ${interpreted.against}`;
+            return `${pack.county}: ${comparisonSentence(pack.focal, other, peers)}`;
+        });
+        if (lines.every((line) => line.includes('No roster is loaded'))) {
+            const saved = remember(previous, { payor, planType, metric, question: message });
+            return {
+                kind: 'unavailable',
+                sessionId: saved.id,
+                answer: `No roster is loaded for ${interpreted.against}, so I can't rank against them.`,
+            };
+        }
+    } else if (interpreted.intent === 'predict' && interpreted.change?.phrase) {
+        kind = 'prediction';
+        const action = interpreted.change.action || 'add';
+        lines = packs.map((pack) => {
+            const matches = (0, entityResolve_1.resolveEntities)(interpreted.change.phrase, pack.catalog);
+            const recommended = matches[0] && (matches.length === 1 || matches[0].score - (matches[1]?.score || 0) >= 0.15) ? matches[0] : null;
+            if (!recommended || recommended.reach == null) return `${pack.county}: ${interpreted.change.phrase} is not on the loaded roster`;
+            const change = { action, name: recommended.name, entityType: recommended.entityType, reach: recommended.reach, overlap: recommended.overlap };
+            const result = (0, rankModel_1.predictChange)({ focal: pack.focal, competitors: pack.competitors, changes: [change] });
+            const verb = action === 'remove' ? 'removing' : 'adding';
+            return `${pack.county}: rank ${result.baseline.rank} to rank ${result.predicted.rank} after ${verb} ${recommended.name}`;
+        });
+    } else {
+        lines = packs.map((pack) => {
+            const result = (0, rankModel_1.predictChange)({ focal: pack.focal, competitors: pack.competitors, changes: [] });
+            return `${pack.county}: rank ${result.baseline.rank} of ${result.baseline.of}`;
+        });
+    }
+    const saved = remember(previous, { payor, planType, metric, question: message });
+    return {
+        kind,
+        sessionId: saved.id,
+        answer: `${payor} ${planType} across ${packs.length} Texas counties. A county was not required. ${lines.join('. ')}.`,
+        counties: packs.map((pack) => pack.county),
+        focal: { payor, planType },
+        metric,
+        geography: { state: 'TX' },
+    };
+}
+
 async function answerRank(input, deps) {
     const message = String(input.message || input.question || '').trim();
     if (refusesWrite(message)) {
@@ -719,7 +879,9 @@ async function answerRank(input, deps) {
     const county = counties.get(countyKey(fromLatest || requestedCounty || fromEarlier || interpreted.county || input.geography?.county || input.context?.county || ''))
         || fromLatest || requestedCounty || fromEarlier || interpreted.county || input.geography?.county || input.context?.county || '';
     if (!county) {
-        const prompt = countyClarify(counties, countyAttempt(message));
+        const attempt = countyAttempt(message);
+        if (!attempt) return answerStatewide({ message, earlier, previous, scope, data, interpreted });
+        const prompt = countyClarify(counties, attempt);
         const saved = remember(previous, {
             question: looksLikeRankQuestion(message) ? message : (previous?.question || earlier || message),
             awaitingCounty: true,
@@ -766,8 +928,9 @@ async function answerRank(input, deps) {
         });
         return { kind: 'clarify', sessionId: saved.id, answer: `${focalChoice.clarify} The county is ${county} County.` };
     }
-    const payor = focalChoice.payor || previous?.payor;
-    const planType = focalChoice.planType || previous?.planType;
+    const selected = keepOurPayor(focalChoice, previous, interpreted.against);
+    const payor = selected.payor;
+    const planType = selected.planType;
     const slice = sliceRows(data.rankings, county, planType);
     if (!slice.length) {
         return { kind: 'needs_data', answer: `No Texas rankings are loaded for ${county} County and ${planType}.`, expectedFiles: rankingsStore_1.RANK_FILE_HELP };
@@ -812,6 +975,21 @@ async function answerRank(input, deps) {
                 competitorSet: [rankingsPayor, ...competitorPayors],
             };
         }
+        if (samePayor(found, rankingsPayor)) {
+            return {
+                kind: 'clarify',
+                sessionId: session.id,
+                answer: `${found} is the selected payor, so name the other payer to compare.`,
+            };
+        }
+        const peers = [focal, ...competitors];
+        const other = peers.find((row) => row.payor === found);
+        const body = baselineBody(session, pack, assumptions);
+        body.kind = 'comparison';
+        body.sessionId = session.id;
+        body.answer = `${focal.payor} ${planType} and ${other.payor} ${planType} in ${county} County, Texas: ${comparisonSentence(focal, other, peers)}.`;
+        body.comparedWith = other.payor;
+        return body;
     }
 
     if (interpreted.intent === 'best') {

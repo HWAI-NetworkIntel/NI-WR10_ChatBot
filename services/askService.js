@@ -18,7 +18,7 @@ const llm_1 = require("./llm");
 const prompts_1 = require("./prompts");
 const sqlGuard_1 = require("../utils/sqlGuard");
 const schemaContext_1 = require("../utils/schemaContext");
-exports.ASK_ERROR_MESSAGE = "I couldn't build a valid query for that. Try naming the payer, county or specialty.";
+exports.ASK_ERROR_MESSAGE = "I couldn't complete that query.";
 const payorName = zod_1.z.string().trim().min(1, 'payor is required').max(200);
 const planTypeName = zod_1.z.string().trim().min(1, 'planType is required').max(25);
 const payorPlanTypeSchema = zod_1.z.object({
@@ -27,14 +27,27 @@ const payorPlanTypeSchema = zod_1.z.object({
 });
 exports.askRequestSchema = zod_1.z.object({
     question: zod_1.z.string().max(500, 'question must be at most 500 characters').transform((value) => value.trim()).pipe(zod_1.z.string().min(1, 'question is required')),
-    payors: zod_1.z.array(payorName, { error: 'payors is required' }).min(1, 'payors is required'),
-    payorsCrossPlanTypes: zod_1.z.array(payorPlanTypeSchema, { error: 'payors cross planTypes is required' }).min(1, 'payors cross planTypes is required'),
+    payors: zod_1.z.array(payorName).optional().default([]),
+    payorsCrossPlanTypes: zod_1.z.array(payorPlanTypeSchema).optional().default([]),
+    payorConfirmed: zod_1.z.boolean().optional(),
     context: zod_1.z.object({
         county: zod_1.z.string().trim().max(200).optional(),
         state: zod_1.z.string().trim().max(200).optional(),
         system: zod_1.z.string().trim().max(200).optional(),
     }).optional(),
+    /** Earlier turns, oldest first, so follow-ups like "add a column for X" can be understood. */
+    history: zod_1.z.array(zod_1.z.object({
+        role: zod_1.z.enum(['user', 'assistant']),
+        content: zod_1.z.string().transform((value) => value.slice(0, 4000)),
+    })).max(40).optional(),
 }).superRefine((value, ctx) => {
+    if (!value.payors.length) {
+        const state = value.context?.state;
+        if (state && !/^(tx|texas)$/i.test(state)) {
+            ctx.addIssue({ code: 'custom', path: ['context', 'state'], message: 'only Texas data is available' });
+        }
+        return;
+    }
     const listed = new Map(value.payors.map((payor) => [payor.toLowerCase(), payor]));
     const covered = new Set();
     const seenPairs = new Set();
@@ -87,11 +100,80 @@ const SCOPE_TABLES = ['ParentOrganization', 'GeographyPlanFilters', 'PlanType'];
 function sqlIncludes(sql, value) {
     return sql.toLowerCase().includes(value.toLowerCase().replace(/'/g, "''"));
 }
+function compactSql(sql) {
+    return String(sql || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+/** "Humana Inc." counts when the SQL filters with LIKE '%humana%'. */
+function payorStem(name) {
+    let key = compactSql(name);
+    let previous = '';
+    while (key && key !== previous) {
+        previous = key;
+        key = key.replace(/(incorporated|corporation|healthcare|company|group|health|corp|inc|llc|co)$/, '');
+    }
+    return key.length >= 4 ? key : '';
+}
+function mentionsPayor(question, payor) {
+    const text = compactSql(question);
+    const full = compactSql(payor);
+    const stem = payorStem(payor);
+    return (full.length >= 4 && text.includes(full)) || Boolean(stem && text.includes(stem));
+}
+function usableCounty(value) {
+    const text = String(value || '').trim();
+    if (!text || /\b(what|which|all|every|any|its|it's|available|where)\b/i.test(text))
+        return '';
+    return text;
+}
+/**
+ * A payor in the body is not the payor for the question.
+ * Use a payor the question names. Otherwise ask the user, unless they just chose one.
+ */
+function resolveAskScope(input, known = {}) {
+    const question = String(input?.question || '');
+    const supplied = Array.isArray(input?.payors) ? input.payors : [];
+    const knownPayors = Array.isArray(known.payors) ? known.payors : [];
+    const named = knownPayors.filter((payor) => mentionsPayor(question, payor));
+    const namedSupplied = supplied.filter((payor) => mentionsPayor(question, payor));
+    const chosen = named.length ? named : namedSupplied;
+    const county = usableCounty(input?.context?.county);
+    const context = input?.context
+        ? { ...input.context, ...(county ? { county } : { county: undefined }) }
+        : undefined;
+    if (!chosen.length && !(input?.payorConfirmed && supplied.length)) {
+        return {
+            clarify: {
+                kind: 'clarify',
+                answer: 'Which payor should I use?',
+                message: 'Which payor should I use?',
+                suggestions: knownPayors,
+                suggestionField: 'payor',
+            },
+        };
+    }
+    const payors = chosen.length ? chosen : supplied;
+    const knownTypes = Array.isArray(known.planTypes) ? known.planTypes : [];
+    const namedTypes = knownTypes.filter((type) => new RegExp(`\\b${type}\\b`, 'i').test(question));
+    const suppliedTypes = [...new Set((input?.payorsCrossPlanTypes || []).map((pair) => pair.planType).filter(Boolean))];
+    const types = namedTypes.length ? namedTypes : (suppliedTypes.length ? suppliedTypes : knownTypes);
+    const payorsCrossPlanTypes = types.length
+        ? payors.flatMap((payor) => types.map((planType) => ({ payor, planType })))
+        : (input?.payorsCrossPlanTypes || []).filter((pair) => payors.some((payor) => payor.toLowerCase() === pair.payor.toLowerCase()));
+    return { input: { ...input, payors, payorsCrossPlanTypes, context } };
+}
+function sqlIncludesPayor(sql, payor) {
+    const hay = compactSql(sql);
+    const full = compactSql(payor);
+    if (full && hay.includes(full))
+        return true;
+    const stem = payorStem(payor);
+    return Boolean(stem) && hay.includes(stem);
+}
 /** Reject SQL that is not limited to the request's payors and payor × plan type pairs. */
 function payorScopeIssue(sql, tables, input) {
     const have = new Set(tables.map((table) => table.toLowerCase()));
     const missingTables = SCOPE_TABLES.filter((table) => !have.has(table.toLowerCase()));
-    const missingPayors = input.payors.filter((payor) => !sqlIncludes(sql, payor));
+    const missingPayors = input.payors.filter((payor) => !sqlIncludesPayor(sql, payor));
     const planTypes = [...new Set(input.payorsCrossPlanTypes.map((pair) => pair.planType))];
     const missingPlanTypes = planTypes.filter((planType) => !sqlIncludes(sql, planType));
     if (!missingTables.length && !missingPayors.length && !missingPlanTypes.length)
@@ -217,6 +299,11 @@ function createDefaultDeps() {
     };
 }
 async function answerQuestion(input, deps = createDefaultDeps()) {
+    const known = deps.rankOptions ? deps.rankOptions() : require('./rankService').rankOptions();
+    const resolved = resolveAskScope(input, { payors: known.payors, planTypes: known.planTypes });
+    if (resolved.clarify)
+        return resolved.clarify;
+    input = resolved.input;
     const started = Date.now();
     const system = (0, prompts_1.textToSqlSystemPrompt)((0, schemaContext_1.renderSchema)(deps.schema, deps.catalog), deps.examples, db_1.MAX_ROWS);
     const questionText = userText(input);
@@ -331,6 +418,8 @@ async function finishData(deps, input, draft, guard, result, llmMs, dbMs, elapse
         timings: { llmMs, dbMs, totalMs },
     };
 }
+exports.payorScopeIssue = payorScopeIssue;
+exports.resolveAskScope = resolveAskScope;
 function formatAskIssues(error) {
     return error.issues.map((issue) => {
         const field = issue.path.length ? issue.path.map(String).join('.') : 'body';
