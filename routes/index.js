@@ -4,6 +4,7 @@ const { answerRank, looksLikeRankQuestion, rankOptions, refusesWrite } = require
 const { answerFromStage2 } = require('../services/stage2Chat')
 const { planQuestion, historyFromBody } = require('../services/conversationPlanner')
 const { buildRankTable } = require('../services/rankTable')
+const { improveRank } = require('../services/rankImprove')
 const { guardrailReason, guardrailReply, withGuidance } = require('../services/guidance')
 
 function loadOptional(name) {
@@ -53,6 +54,13 @@ async function safePlan(input) {
 function chatTable(table) {
   const { markdown, ...rest } = table
   return { ...rest, answer: markdown ? `${table.answer}\n\n${markdown}` : table.answer }
+}
+
+/** Routes the planner answers straight from the data files: rank tables and "how do we improve". */
+function plannedAnswer(plan, context) {
+  if (plan?.route === 'table') return buildRankTable(plan.table, context)
+  if (plan?.route === 'improve') return improveRank(plan.improve || {}, context)
+  return null
 }
 
 /** Stage 2 (Python) first, then the roster rank model. */
@@ -115,9 +123,10 @@ router.post('/ask', async (req, res) => {
     const plan = await safePlan({ ...input, history })
     const blockedPlan = plan ? guardrailReason(plan.standalone) : ''
     if (blockedPlan) return res.json(guardrailReply(blockedPlan))
-    if (plan?.route === 'table') {
-      const { markdown: _markdown, ...table } = buildRankTable(plan.table, input)
-      return res.json({ ...table, standalone: plan.standalone })
+    const direct = plannedAnswer(plan, input)
+    if (direct) {
+      const { markdown: _markdown, ...payload } = direct
+      return res.json({ ...withGuidance(payload), standalone: plan.standalone })
     }
     if (plan?.route === 'rank') {
       const earlier = userTexts(history).join('\n')
@@ -160,7 +169,8 @@ router.post('/rank', async (req, res) => {
     const blocked = guardrailReason(message)
     if (blocked) return res.json(guardrailReply(blocked))
     const plan = await safePlan({ ...body, question: message, history: historyFromBody(body) })
-    if (plan?.route === 'table') return res.json({ ...chatTable(buildRankTable(plan.table, body)), standalone: plan.standalone })
+    const direct = plannedAnswer(plan, body)
+    if (direct) return res.json({ ...withGuidance(chatTable(direct)), standalone: plan.standalone })
     const { status, payload } = await rankThread(body, message, earlier)
     return res.status(status).json(withGuidance(payload))
   } catch (err) {
@@ -181,9 +191,10 @@ router.post('/llm/chat', async (req, res) => {
   // A caller asking for JSON controls its own format, so it skips the planner and rank routing.
   const callerFormat = /\bjson\b/i.test(parsed.data.system || '')
   const plan = callerFormat ? null : await safePlan({ ...req.body, question: userText, history: historyFromBody(parsed.data) })
-  if (plan?.route === 'table') {
-    const table = chatTable(buildRankTable(plan.table, req.body))
-    return res.json({ content: table.answer, ...table, standalone: plan.standalone })
+  const direct = plannedAnswer(plan, req.body)
+  if (direct) {
+    const payload = withGuidance(chatTable(direct))
+    return res.json({ content: payload.answer, ...payload, standalone: plan.standalone })
   }
   const rankLike = plan?.route === 'rank'
     || looksLikeRankQuestion(userText)

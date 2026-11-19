@@ -15,7 +15,7 @@
 
 const { normalizeTableSpec } = require('./rankTable')
 
-const ROUTES = ['table', 'rank', 'sql', 'chat']
+const ROUTES = ['table', 'improve', 'rank', 'sql', 'chat']
 const MAX_TURNS = 8
 const MAX_TURN_CHARS = 1500
 
@@ -25,7 +25,8 @@ const PLANNER_SYSTEM = [
   '',
   'Fields:',
   '- standalone: the latest question rewritten so it makes sense with no conversation. Resolve "it", "that", "same", "those", "these counties", "add a column", "also show" from earlier turns. Do not add facts the user did not give.',
-  '- route: one of table, rank, sql, chat.',
+  '- route: one of table, improve, rank, sql, chat.',
+  '  improve: how to improve, raise, or make our rank or network score better, why we rank below a payor, what we lack against competitors, or what to fix in our network. No named health system or group to add or remove.',
   '  table: show, list, or tabulate published payor rankings or network scores across several rows: rank lists, top N, ranks for every county, a table of ranks, ranks across counties or payors, or changing the columns of an earlier rank table. No hypothetical change.',
   '  rank: one current rank ("where do we rank in Harris County"), how we rank against one named payor, a what-if change (add, remove, drop, terminate a health system or physician group), or how close we are to a rank.',
   '  sql: anything else answered from network data: provider or hospital counts, specialties, enrollment, plans, bids, languages, distances. Also use sql when a rank table needs a column that is not in FIELDS (for example enrollment or provider counts).',
@@ -40,6 +41,8 @@ const PLANNER_SYSTEM = [
   '  filters.payor and filters.planType hold only payors or plan types the user named. Leave them empty for "we" / "our": scope "dashboard" already applies dashboardPayors.',
   '  pivot: use when the user wants one field across the top, for example counties down the side, payors across, rank in each cell.',
   '  filters.county empty means every Texas county. rankMax 3 means rank 3 or better.',
+  '- improve: an object only when route is improve, otherwise null: { "county": "", "payor": "", "planType": "", "comparePayor": "" }.',
+  '  county is "" for every county. payor and planType are "" for "we" / "our" (dashboardPayors apply). comparePayor is a payor the user wants to be compared against, else "".',
   'FIELDS: county, fips, payor, planType, network, metric, value (the network score), rank, payorsRanked (how many payors are ranked in that county and plan type), asOf.',
   'Never invent a county, payor, or plan type that the user or the conversation did not name.',
 ].join('\n')
@@ -73,9 +76,18 @@ function parsePlan(text, question) {
     route,
     standalone: clip(standalone, 500),
     table: route === 'table' ? normalizeTableSpec(value.table) : null,
+    improve: route === 'improve' ? improveSpec(value.improve) : null,
     source: 'model',
   }
 }
+
+function improveSpec(raw) {
+  const value = raw && typeof raw === 'object' ? raw : {}
+  const text = (field) => clip(String(value[field] ?? '').trim(), 200)
+  return { county: text('county'), payor: text('payor'), planType: text('planType'), comparePayor: text('comparePayor') }
+}
+
+const IMPROVE = /\b(improve|better|boost|raise|increase|lift|climb|move up|strengthen)\b.{0,40}\b(rank(?:s|ing|ings)?|score|position|network)\b|\b(rank(?:s|ing|ings)?|score)\b.{0,30}\b(better|higher|up)\b|\bwhy\b.{0,40}\b(rank|behind|below|lower)\b|\bwhat (?:do|should) we (?:need|lack|fix|improve)\b/i
 
 const WHAT_IF = /\b(add|adding|remove|removing|drop|dropping|terminat\w*|if we|what if|how close|how much)\b/i
 const TABLE_WORDS = /\b(table|tabular|tabulate|list|all|every|each|counties|across|by county|per county|top\s+\d+)\b/i
@@ -84,6 +96,10 @@ const RANK_WORDS = /\brank(?:s|ed|ing|ings)?\b|\bnetwork scores?\b/i
 /** Used only when the model is unavailable. Returns null to keep the endpoint's existing behaviour. */
 function planFromRules(question) {
   const text = String(question || '')
+  if (IMPROVE.test(text) && !/\b(add|adding|remove|removing|drop|dropping|terminat\w*|what if|if we)\b/i.test(text)) {
+    const county = text.match(/\b(?:in|for)\s+([A-Z][a-zA-Z .'-]{1,30}?)\s+county\b/i)
+    return { route: 'improve', standalone: text, improve: improveSpec({ county: county ? county[1] : '' }), table: null, source: 'rules' }
+  }
   if (RANK_WORDS.test(text) && TABLE_WORDS.test(text) && !WHAT_IF.test(text)) {
     const scope = /\b(all|every)\s+(payors?|payers?|competitors?|plans?)\b|\bcompetitors?\b/i.test(text) ? 'all' : 'dashboard'
     return { route: 'table', standalone: text, table: normalizeTableSpec({ scope }), source: 'rules' }

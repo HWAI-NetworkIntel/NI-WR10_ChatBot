@@ -27,7 +27,7 @@ const FIELDS = {
   metric: { label: 'Metric', get: (row) => row.metric },
   value: { label: 'Network score', get: (row) => round(row.value) },
   rank: { label: 'Rank', get: (row) => row.rank },
-  payorsRanked: { label: 'Payors ranked', get: (row) => row.payorsRanked },
+  payorsRanked: { label: 'Ranked networks', get: (row) => row.payorsRanked },
   asOf: { label: 'As of', get: (row) => row.asOf },
 }
 
@@ -141,16 +141,16 @@ function sameCounty(wanted, actual) {
 function enrich(rankings) {
   const groups = new Map()
   for (const row of rankings) {
-    const key = `${compact(row.county)}|${compact(row.planType)}|${compact(row.metric)}`
+    // Published ranks are county-wide: HMO and PPO networks compete in one list (Stage2_dynamic RANK_SCOPE).
+    const key = `${compact(row.county)}|${compact(row.metric)}`
     if (!groups.has(key)) groups.set(key, [])
     groups.get(key).push(row)
   }
   const out = []
   for (const rows of groups.values()) {
-    const payors = new Set(rows.map((row) => compact(row.payor)))
     for (const row of rows) {
       const computed = 1 + rows.filter((other) => other.value > row.value).length
-      out.push({ ...row, rank: row.publishedRank ?? computed, payorsRanked: payors.size })
+      out.push({ ...row, rank: row.publishedRank ?? computed, payorsRanked: rows.length })
     }
   }
   return out
@@ -319,7 +319,7 @@ function buildRankTable(rawSpec, context = {}, deps = {}) {
   const table = spec.pivot ? pivotTable(matched, spec) : flatTable(matched, spec)
   const assumptions = [
     `Source: published rankings${metrics.length ? ` (${metrics.join(', ')})` : ''}${asOf.length ? `, as of ${asOf.join(', ')}` : ''}.`,
-    'Rank 1 is the strongest network among payors with that plan type in the county.',
+    'Rank 1 is the strongest network in the county. HMO and PPO networks are ranked together in one list.',
     ...table.notes,
   ]
   if (spec.scope === 'dashboard' && !spec.filters.payor.length) assumptions.push('Limited to the dashboard payors. Ask for "all payors" to include competitors.')

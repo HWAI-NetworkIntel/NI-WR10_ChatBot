@@ -31,9 +31,9 @@ test('unknown columns and fields from the model are dropped', () => {
 test('our rank in every county, with the columns the user asked for', () => {
   const table = buildRankTable({ columns: ['county', 'rank', 'payorsRanked', 'value', 'network'] }, dashboard, deps)
   assert.equal(table.kind, 'data')
-  assert.deepEqual(table.columns, ['County', 'Rank', 'Payors ranked', 'Network score', 'Network'])
+  assert.deepEqual(table.columns, ['County', 'Rank', 'Ranked networks', 'Network score', 'Network'])
   assert.deepEqual(table.rows, [
-    ['Dallas', 1, 2, 70, 'Molina Healthcare, Inc. net'],
+    ['Dallas', 1, 3, 70, 'Molina Healthcare, Inc. net'],
     ['Harris', 2, 3, 60, 'Molina Healthcare, Inc. net'],
   ])
 })
