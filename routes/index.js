@@ -4,6 +4,7 @@ const { answerRank, looksLikeRankQuestion, rankOptions, refusesWrite } = require
 const { answerFromStage2 } = require('../services/stage2Chat')
 const { planQuestion, historyFromBody } = require('../services/conversationPlanner')
 const { buildRankTable } = require('../services/rankTable')
+const { guardrailReason, guardrailReply, withGuidance } = require('../services/guidance')
 
 function loadOptional(name) {
   try {
@@ -106,15 +107,14 @@ router.post('/ask', async (req, res) => {
   if (!askRequestSchema || !answerQuestion) return res.status(503).json({ error: 'Schema is not loaded' })
   const parsed = askRequestSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: formatAskIssues(parsed.error) })
-  if (refusesWrite(parsed.data.question)) {
-    return res.json({ kind: 'refused', message: "I can't change the network tables. Ask a read-only question." })
-  }
+  // Checked before anything else, so a blocked question never asks for a payor first.
+  const blocked = guardrailReason(parsed.data.question)
+  if (blocked) return res.json(guardrailReply(blocked))
   try {
     const { history = [], ...input } = parsed.data
     const plan = await safePlan({ ...input, history })
-    if (plan && refusesWrite(plan.standalone)) {
-      return res.json({ kind: 'refused', message: "I can't change the network tables. Ask a read-only question." })
-    }
+    const blockedPlan = plan ? guardrailReason(plan.standalone) : ''
+    if (blockedPlan) return res.json(guardrailReply(blockedPlan))
     if (plan?.route === 'table') {
       const { markdown: _markdown, ...table } = buildRankTable(plan.table, input)
       return res.json({ ...table, standalone: plan.standalone })
@@ -126,11 +126,11 @@ router.post('/ask', async (req, res) => {
     }
     if (!getSchemaContext()) return res.status(503).json({ error: 'Schema is not loaded' })
     const question = (plan?.standalone || input.question).slice(0, 500)
-    const result = await answerQuestion({ ...input, question })
+    const result = withGuidance(await answerQuestion({ ...input, question }))
     return res.json(plan ? { ...result, standalone: question } : result)
   } catch (err) {
     console.error(JSON.stringify({ event: 'ask', name: err instanceof Error ? err.name : 'Error' }))
-    return res.status(500).json({ kind: 'error', message: ASK_ERROR_MESSAGE })
+    return res.status(500).json(withGuidance({ kind: 'error', message: ASK_ERROR_MESSAGE }))
   }
 })
 
@@ -157,13 +157,15 @@ router.post('/rank', async (req, res) => {
     const texts = userTexts(body.messages)
     const message = String(body.message || body.question || texts.at(-1) || '').trim()
     const earlier = body.earlier || texts.slice(0, -1).join('\n')
+    const blocked = guardrailReason(message)
+    if (blocked) return res.json(guardrailReply(blocked))
     const plan = await safePlan({ ...body, question: message, history: historyFromBody(body) })
     if (plan?.route === 'table') return res.json({ ...chatTable(buildRankTable(plan.table, body)), standalone: plan.standalone })
     const { status, payload } = await rankThread(body, message, earlier)
-    return res.status(status).json(payload)
+    return res.status(status).json(withGuidance(payload))
   } catch (err) {
     console.error(JSON.stringify({ event: 'rank', name: err instanceof Error ? err.name : 'Error' }))
-    return res.status(500).json({ kind: 'error', answer: "I couldn't evaluate that rank change." })
+    return res.status(500).json(withGuidance({ kind: 'error', answer: "I couldn't evaluate that rank change." }))
   }
 })
 
@@ -174,9 +176,8 @@ router.post('/llm/chat', async (req, res) => {
   const texts = userTexts(parsed.data.messages)
   const userText = texts.at(-1) || ''
   const earlier = texts.slice(0, -1).join('\n')
-  if (refusesWrite(userText) || refusesWrite(parsed.data.system)) {
-    return res.json({ content: "I can't change the network tables. Ask a read-only rank question.", kind: 'refused' })
-  }
+  const blocked = guardrailReason(userText) || (refusesWrite(parsed.data.system) ? 'write' : '')
+  if (blocked) return res.json(guardrailReply(blocked))
   // A caller asking for JSON controls its own format, so it skips the planner and rank routing.
   const callerFormat = /\bjson\b/i.test(parsed.data.system || '')
   const plan = callerFormat ? null : await safePlan({ ...req.body, question: userText, history: historyFromBody(parsed.data) })

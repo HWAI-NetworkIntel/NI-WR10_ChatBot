@@ -258,7 +258,10 @@ function describeScope(spec, context) {
   const { county, payor, planType, rankMax, rankMin } = spec.filters
   if (payor.length) parts.push(payor.join(', '))
   else if (spec.scope === 'dashboard' && context?.payorsCrossPlanTypes?.length) {
-    parts.push(context.payorsCrossPlanTypes.map((pair) => `${pair.payor} (${pair.planType})`).join(', '))
+    const pairs = context.payorsCrossPlanTypes
+    parts.push(pairs.length <= 3
+      ? pairs.map((pair) => `${pair.payor} (${pair.planType})`).join(', ')
+      : `${pairs.length} dashboard payor × plan type pairs`)
   } else parts.push('all payors')
   if (planType.length) parts.push(planType.join('/'))
   parts.push(county.length ? `${county.join(', ')} County` : 'every Texas county')

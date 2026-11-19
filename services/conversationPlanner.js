@@ -34,7 +34,8 @@ const PLANNER_SYSTEM = [
   '  { "columns": [...], "filters": { "county": [], "payor": [], "planType": [], "rankMax": null, "rankMin": null },',
   '    "scope": "dashboard" | "all", "pivot": null | { "rows": field, "columns": field, "value": field },',
   '    "sort": [ { "field": field, "dir": "asc" | "desc" } ], "limit": number | null }',
-  '  columns: ordered fields from FIELDS. Include every column the user asked for. When the user changes an earlier table, keep its columns and add or remove only what they asked.',
+  '  columns: ordered fields from FIELDS. Include every column the user asked for, and no more than the question needs. Leave out metric and asOf unless the user asks for them. When the user changes an earlier table, keep its columns and add or remove only what they asked.',
+  '  "in tabular format", "as a table", "tabulate", "make it a table" mean: show the data from the previous answer as a table. Keep the same county, payors, plan types and subject as that answer. Do not widen it to every payor or every county.',
   '  scope: "dashboard" for our own payors (dashboardPayors, "we", "us", "our", "my") and "all" when the user wants every payor or competitors.',
   '  filters.payor and filters.planType hold only payors or plan types the user named. Leave them empty for "we" / "our": scope "dashboard" already applies dashboardPayors.',
   '  pivot: use when the user wants one field across the top, for example counties down the side, payors across, rank in each cell.',
@@ -77,7 +78,7 @@ function parsePlan(text, question) {
 }
 
 const WHAT_IF = /\b(add|adding|remove|removing|drop|dropping|terminat\w*|if we|what if|how close|how much)\b/i
-const TABLE_WORDS = /\b(table|list|all|every|each|counties|across|by county|per county|top\s+\d+)\b/i
+const TABLE_WORDS = /\b(table|tabular|tabulate|list|all|every|each|counties|across|by county|per county|top\s+\d+)\b/i
 const RANK_WORDS = /\brank(?:s|ed|ing|ings)?\b|\bnetwork scores?\b/i
 
 /** Used only when the model is unavailable. Returns null to keep the endpoint's existing behaviour. */
