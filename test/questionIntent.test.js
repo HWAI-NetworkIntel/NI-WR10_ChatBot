@@ -62,22 +62,19 @@ test('a missing model still routes a termination and a rank question', async () 
   assert.equal(rank.scenario.county, '')
 })
 
-test('a rank read calls Python and an addition does not', async () => {
+test('a rank read and an addition never call Python: current ranks come from the local data', async () => {
   const calls = []
   const runStage2 = async (scenario) => {
     calls.push(scenario)
-    return { ok: true, rankColumn: 'rank_payor_plantype', rows: [{ county: 'Harris', rank: 2, rankBefore: 2 }, { county: 'Houston', rank: 4, rankBefore: 4 }] }
+    return { ok: true, rankColumn: 'rank_payor_plantype', rows: [] }
   }
   const rank = await answerFromStage2({ ...scope, message: 'Where do we rank?' }, {
     chat: async () => JSON.stringify({ action: 'get_rank' }),
     lookupsReady: () => true,
     runStage2,
   })
-  assert.equal(rank.kind, 'rank')
-  assert.equal(calls[0].healthSystem, '')
-  assert.match(rank.answer, /Harris/)
-  assert.match(rank.answer, /Houston/)
-  assert.equal(rank.suggestions, undefined)
+  // null hands the question to the published rank path (rankings.csv / network_ratings.csv).
+  assert.equal(rank, null)
 
   const added = await answerFromStage2({ ...scope, message: 'Add Baylor Scott & White' }, {
     chat: async () => JSON.stringify({ action: 'add', healthSystem: 'Baylor Scott & White' }),
@@ -87,7 +84,7 @@ test('a rank read calls Python and an addition does not', async () => {
   assert.equal(added.answer, undefined)
   assert.equal(added.change.action, 'add')
   assert.equal(added.change.name, 'Baylor Scott & White')
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 0)
 })
 
 test('a removal calls Python with the increase flag false', async () => {

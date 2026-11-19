@@ -65,6 +65,7 @@ PLAN_TYPE_RULES = {
     'HMO-POS': 'HMO',
     'Local PPO': 'PPO',
     'Regional PPO': 'PPO',
+    'PPO': 'PPO',          # already mapped (Stage3 output used as input)
 }
 RANK_LEVELS = {
     'rank_payor_plantype_planid': [PAYOR_COL, 'Plan_Type', 'PlanID'],
@@ -209,7 +210,10 @@ def load_lookups(force=False):
     _LK['lsc_cols'] = cols[:i_cf]
     _LK['mid_cols'] = cols[i_cf:i_hw]
     _LK['weight_cols'] = [c for c in _LK['weights'].columns if c != 'Category']
-    print('Lookups loaded from', LOOKUP_DIR)
+
+    # networks with no physician row data (no Ind_network_file): their Stage1 values stay at baseline
+    _LK['frozen_nets'] = set(sc['network_id'].unique()) - set(_LK['phy_rows']['network_id'].unique())
+    print('Lookups loaded from', LOOKUP_DIR, '| networks kept at baseline Stage1 values:', len(_LK['frozen_nets']))
     return _LK
 
 
@@ -610,6 +614,27 @@ def rank_table(final):
 
     return df.drop(columns=["_w", "_ws"])
 
+def _freeze_stage1(npi_score, clean_df, fips):
+    """Networks without physician row data keep their baseline Stage1 values (high counts, %,
+    PU based counts, pcp+spe percent) instead of being recomputed as zero."""
+    L = _load_base()
+    nets = L['frozen_nets']
+    b = L['base_final']
+    b = b[b[FIPS].isin(fips) & b['network_id'].isin(nets)]
+    if b.empty:
+        return npi_score, clean_df
+    keys = [FIPS, 'network_id']
+
+    s1_cols = [c for c in npi_score.columns if c not in keys and c in b.columns]
+    frozen = b[keys + s1_cols].drop_duplicates(subset=keys)
+    npi_score = pd.concat([npi_score[~npi_score['network_id'].isin(nets)], frozen], ignore_index=True)
+
+    clean_cols = [c for c in clean_df.columns if c not in ['state'] + keys and c in b.columns]
+    frozen = b[['state'] + keys + clean_cols].drop_duplicates(subset=keys)
+    clean_df = pd.concat([clean_df[~clean_df['network_id'].isin(nets)], frozen], ignore_index=True)
+    return npi_score, clean_df
+
+
 ###################################### Main entry points ######################################
 
 
@@ -617,6 +642,7 @@ def build_final(sc_phy, sc_hosp, s1_pcp, s1_spe, s1_hosp, fips):
     """Full chain for the given counties -> final table rows (unranked)."""
     fips = list(fips)
     npi_score, clean_df = _stage1(s1_pcp, s1_spe, s1_hosp, fips)
+    npi_score, clean_df = _freeze_stage1(npi_score, clean_df, fips)
     mjhs_submarket = _count_scores(sc_phy, sc_hosp, fips)
     scaled_df = npi_score.merge(mjhs_submarket, how='right', on=[FIPS, 'network_id'])
     scaled_df[FIPS] = scaled_df[FIPS].astype('int64')
@@ -827,6 +853,88 @@ def _rows_payload(before, after, rank_col):
     return rows
 
 
+def _county_ranks(before, after, counties):
+    """Every payor x plan type in the given counties: rank before and after (rank_payor_plantype)."""
+    keys = ['county_name', PAYOR_COL, 'Plan_Type']
+    col = 'rank_payor_plantype'
+
+    def collapse(frame):
+        part = frame[frame['county_name'].isin(counties)][keys + [col]].dropna(subset=[col])
+        return part.drop_duplicates(subset=keys)
+
+    merged = collapse(after).merge(collapse(before).rename(columns={col: '_before'}), on=keys, how='left')
+    merged = merged.sort_values(['county_name', col, 'Plan_Type', PAYOR_COL])
+    return [{
+        'county': _json_cell(row['county_name']),
+        'payor': _json_cell(row[PAYOR_COL]),
+        'planType': _json_cell(row['Plan_Type']),
+        'rank': _json_cell(row[col]),
+        'rankBefore': _json_cell(row['_before']),
+    } for _, row in merged.iterrows()]
+
+
+# Measures the chatbot shows to explain a rank move, enrollment weighted per county x payor x plan type.
+EXPLAIN_MEASURES = {
+    'hospitals': '# of Hospitals',
+    'highQualityHospitals': 'Hosp_Quality Score rating',
+    'hospitalQualityPct': 'Hosp_Quality Score %',
+    'pcps': '# of PCP',
+    'specialists': '# of Specialist',
+    'pcpQualityPct': 'PCP_Quality Score %',
+    'specialistQualityPct': 'Spe_Quality Score %',
+    'starRating': 'Modified Hwai Rating',
+}
+
+
+def _weighted_measures(frame, counties, payor, plan_type):
+    keys = ['county_name', PAYOR_COL, 'Plan_Type']
+    part = frame[frame['county_name'].isin(counties)]
+    if payor:
+        part = part[part[PAYOR_COL].isin(_as_list(payor))]
+    if plan_type:
+        part = part[part['Plan_Type'].isin(_as_list(plan_type))]
+    part = part.drop_duplicates(subset=keys + ['PlanID'])
+    out = {}
+    for key, group in part.groupby(keys, sort=False):
+        weight = pd.to_numeric(group[ENROLLMENT_COL], errors='coerce').fillna(0).clip(lower=0)
+        values = {}
+        for name, column in EXPLAIN_MEASURES.items():
+            if column not in group.columns:
+                continue
+            series = pd.to_numeric(group[column], errors='coerce')
+            mask = series.notna()
+            if not mask.any():
+                continue
+            w = weight[mask]
+            values[name] = float((series[mask] * w).sum() / w.sum()) if w.sum() > 0 else float(series[mask].mean())
+        out[key] = values
+    return out
+
+
+def _county_measures(before, after, counties, payor, plan_type):
+    """The scoped payor's measures before and after the drop, per county and plan type."""
+    old = _weighted_measures(before, counties, payor, plan_type)
+    new = _weighted_measures(after, counties, payor, plan_type)
+    rows = []
+    for key in sorted(set(old) | set(new)):
+        rows.append({
+            'county': _json_cell(key[0]),
+            'payor': _json_cell(key[1]),
+            'planType': _json_cell(key[2]),
+            'before': old.get(key, {}),
+            'after': new.get(key, {}),
+        })
+    return rows
+
+
+def _affected_counties(ranked):
+    fips = set(ranked.attrs.get('affected_fips') or [])
+    if not fips:
+        return []
+    names = ranked[ranked[FIPS].isin(fips)]['county_name'].dropna().unique().tolist()
+    return sorted(str(name) for name in names)
+
+
 def _missing_lookups():
     needed = list(LK_FILES.values()) + [BASE_FINAL_FILE, BASE_RANKED_FILE]
     return [name for name in needed if not os.path.exists(LOOKUP_DIR + name)]
@@ -899,8 +1007,12 @@ def run_cli(argv=None):
         drops.append({'type': 'health_system', 'name': health, 'payor': payor, 'plan_type': plan_type, 'plan_id': plan_id})
     if group:
         drops.append({'type': 'group', 'name': group, 'payor': payor, 'plan_type': plan_type, 'plan_id': plan_id})
-    ranked = run_scenario(drops) if drops else before
+    ranked = run_scenario(drops) if drops else None
     after = rank_view(ranked, payor, plan_type, plan_id, county) if drops else before
+    affected = _affected_counties(ranked) if drops else []
+    shown = [county] if county else affected
+    county_ranks = _county_ranks(_load_base()['base_ranked'], ranked, shown) if drops and shown else []
+    county_measures = _county_measures(_load_base()['base_ranked'], ranked, shown, payor, plan_type) if drops and shown and payor else []
     rank_col = _rank_column(payor, plan_type, plan_id)
     return _emit({
         'ok': True,
@@ -916,6 +1028,9 @@ def run_cli(argv=None):
             'county': county,
         },
         'rows': _rows_payload(before, after, rank_col),
+        'affectedCounties': affected,
+        'countyRanks': county_ranks,
+        'countyMeasures': county_measures,
     })
 
 

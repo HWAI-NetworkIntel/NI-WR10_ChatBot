@@ -23,10 +23,34 @@ function pythonCommand() {
   return command.toLowerCase() === 'py' ? { command, prefix: ['-3'] } : { command, prefix: [] }
 }
 
-/** Run Stage2_dynamic.py and resolve the JSON object it prints. */
-function runStage2(scenario) {
+// One run reloads every lookup file (about 20 s), so successful results are kept until the lookups change.
+const CACHE_LIMIT = 50
+const cache = new Map()
+
+function lookupStamp() {
+  try {
+    return String(fs.statSync(path.join(process.env.NI_LOOKUP_DIR || '', 'base_ranked.csv')).mtimeMs)
+  } catch {
+    return ''
+  }
+}
+
+/** Run Stage2_dynamic.py and resolve the JSON object it prints. Same scenario and lookups: cached result. */
+async function runStage2(scenario) {
+  const argv = toArgv(scenario)
+  const key = `${lookupStamp()}|${JSON.stringify(argv)}`
+  if (cache.has(key)) return cache.get(key)
+  const result = await spawnStage2(argv)
+  if (result?.ok) {
+    if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value)
+    cache.set(key, result)
+  }
+  return result
+}
+
+function spawnStage2(argv) {
   const { command, prefix } = pythonCommand()
-  const args = [...prefix, SCRIPT, ...toArgv(scenario)]
+  const args = [...prefix, SCRIPT, ...argv]
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { windowsHide: true, env: process.env })
     let stdout = ''

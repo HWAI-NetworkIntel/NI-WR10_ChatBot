@@ -1,7 +1,7 @@
 ﻿const express = require('express')
 const { config } = require('../config/config')
 const { answerRank, looksLikeRankQuestion, rankOptions, refusesWrite } = require('../services/rankService')
-const { answerFromStage2 } = require('../services/stage2Chat')
+const { answerFromStage2, explainWhatIf } = require('../services/stage2Chat')
 const { planQuestion, historyFromBody } = require('../services/conversationPlanner')
 const { buildRankTable } = require('../services/rankTable')
 const { improveRank, findOpportunities } = require('../services/rankImprove')
@@ -174,6 +174,16 @@ function plannedPayorCheck(plan, message, body) {
   return { body }
 }
 
+/**
+ * "Why did United's rank drop?" after a removal what-if: explained from that same what-if run,
+ * before the planner can send it to the published-rank improvement answer. Null when it does not apply.
+ */
+async function whatIfFollowUp(body, question, turn, prior) {
+  const explained = await explainWhatIf({ ...body, message: question, question })
+  if (!explained) return null
+  return finishTurn(withGuidance(explained), { plan: null, body, question, prior, note: turn.note })
+}
+
 /** Stage 2 (Python) first, then the roster rank model. */
 async function rankThread(body, message, earlier) {
   const stage2 = await answerFromStage2({ ...body, message, earlier })
@@ -234,6 +244,12 @@ router.post('/ask', async (req, res) => {
   if (blocked) return res.json({ ...guardrailReply(blocked), state: prior })
   const turn = prepareTurn(parsed.data.question, parsed.data, prior)
   if (turn.reply) return res.json(turn.reply)
+  try {
+    const followUp = await whatIfFollowUp(turn.body, turn.question, turn, prior)
+    if (followUp) return res.json(followUp)
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'ask', name: err instanceof Error ? err.name : 'Error' }))
+  }
   const checked = payorCheck(turn.question, turn.body)
   if (checked.reply) return res.json({ ...checked.reply, state: prior })
   try {
@@ -300,6 +316,8 @@ router.post('/rank', async (req, res) => {
     const turn = prepareTurn(message, req.body ?? {}, prior)
     if (turn.reply) return res.json(turn.reply)
     const asked = turn.question
+    const followUp = await whatIfFollowUp(turn.body, asked, turn, prior)
+    if (followUp) return res.json(followUp)
     const checked = payorCheck(asked, turn.body)
     if (checked.reply) return res.json({ ...checked.reply, state: prior })
     const plan = await safePlan({ ...checked.body, question: asked, history: historyFromBody(checked.body), state: prior })
@@ -332,6 +350,14 @@ router.post('/llm/chat', async (req, res) => {
   const turn = callerFormat ? { question: typed, body: req.body, note: '' } : prepareTurn(typed, req.body, prior)
   if (turn.reply) return res.json(turn.reply)
   const userText = turn.question
+  if (!callerFormat) {
+    try {
+      const followUp = await whatIfFollowUp(turn.body, userText, turn, prior)
+      if (followUp) return res.json({ content: followUp.answer, ...followUp })
+    } catch (err) {
+      console.error(JSON.stringify({ event: 'rank', name: err instanceof Error ? err.name : 'Error' }))
+    }
+  }
   const checked = callerFormat ? { body: req.body } : payorCheck(userText, turn.body)
   if (checked.reply) return res.json({ ...checked.reply, state: prior })
   const plan = callerFormat ? null : await safePlan({ ...checked.body, question: userText, history: historyFromBody(parsed.data), state: prior })
